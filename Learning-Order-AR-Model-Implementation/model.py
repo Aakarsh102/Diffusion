@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 class Model(nn.Module):
     def __init__(self, device, d_model, seq_len, n_layers, n_heads, vocab_size, mask_id = 0, max_len = 1024):
+        super().__init__() 
         self.n_layers = 2
         self.n_heads = 2
         self.device = device
@@ -35,13 +36,14 @@ class Model(nn.Module):
 
     def encode(self, batch, use_mask = True):
         #Batch, seq_len
-        B, L = batch.size
+        B, L = batch.shape
         pos = torch.arange(L, device = batch.device).unsqueeze(0).expand((B, L))
         emb = self.tok_emb(batch) + self.pos_emb(pos)  # [B, L, d_model]
-        if not use_mask:
-            h = self.transformer(emb)  # [B, L, d_model]
-            return h
-        attn_mask = self.create_attention_mask_per_batch(batch)  # [B*n_heads, L, L]
+        if use_mask:
+            attn_mask = self.create_attention_mask(x)
+            h = self.transformer(emb, mask=attn_mask)
+        else:
+            h = self.transformer(emb) 
         return h
 
     def forward(self, x_in, x_target):
@@ -69,59 +71,86 @@ class Model(nn.Module):
     
 
     @torch.no_grad()
-    def generate(self, batch_size, seq_len, temperature=1.0, 
-             sample_order=False, sample_token=False, topk=None,
-             use_attention_mask=True, eos_token_id=None, 
-             stop_on_eos=True):
+    def generate_variable_length(self, batch_size, max_len, temperature=1.0,
+                                sample_order=False, sample_token=False, 
+                                topk=None, use_attention_mask=True,
+                                eos_token_id=None, pad_token_id=None):
+        """
+        Generate variable-length sequences, stopping when EOS is generated
         
-        x = torch.full((batch_size, seq_len), self.mask_id, device = self.device, dtype=torch.bool)
-
-        if stop_on_eos and eos_token_id is not None:
-            finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
-        else:
-            finished = None
-
-        for step in range(seq_len):
-            if finished is not None and finished.all():
+        Returns:
+            x: [B, max_len] - generated sequences (padded to max_len)
+            lengths: [B] - actual lengths of each sequence (including EOS)
+        """
+        if eos_token_id is None:
+            raise ValueError("eos_token_id must be provided for variable-length generation")
+        if pad_token_id is None:
+            pad_token_id = self.mask_id  # Use mask as pad by default
+        
+        # Start fully masked
+        x = torch.full((batch_size, max_len), self.mask_id,
+                    dtype=torch.long, device=self.device)
+        
+        # Track finished sequences and their lengths
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        lengths = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        
+        for step in range(max_len):
+            # Stop if all finished
+            if finished.all():
                 break
-            h = self.encode(x, use_mask=use_attention_mask)  # [B, L, d_model]
-            order_scores = self.order_head(h).squeeze(-1)    # [B, L]
-            masked_scores = self.token_head(h)
-            M = (x == self.mask_id)
-            if finished is not None:
-                M = M & ~finished.unsqueeze(1)
+            
+            # Encode
+            h = self.encode(x, use_attention_mask=use_attention_mask)
+            
+            # Get order scores (only for unfinished sequences)
+            order_scores = self.order_head(h).squeeze(-1)
+            M = (x == self.mask_id) & ~finished.unsqueeze(1)
+            
             if not M.any():
                 break
+            
             order_scores_masked = order_scores.masked_fill(~M, float('-inf'))
+            
+            # Select positions
             if sample_order:
                 order_probs = F.softmax(order_scores_masked / temperature, dim=-1)
-                # Handle case where some batches have no valid positions
                 order_probs = torch.nan_to_num(order_probs, 0.0)
                 next_pos = torch.multinomial(order_probs, num_samples=1).squeeze(-1)
             else:
                 next_pos = order_scores_masked.argmax(dim=-1)
             
-            token_logits_all = self.token_head(h) # [B, L, V]
-            token_logits = token_logits_all[torch.arange(batch_size), next_pos] # [B, V]
-            tok_logits = token_logits / temperature
-
-            if topk is not None: 
+            # Get token predictions
+            tok_logits = self.token_head(h)[torch.arange(batch_size), next_pos]
+            tok_logits = tok_logits / temperature
+            
+            if topk is not None:
                 v, _ = torch.topk(tok_logits, min(topk, tok_logits.size(-1)))
                 tok_logits[tok_logits < v[:, [-1]]] = float('-inf')
-            if sample_token:
-                new_token = torch.distributions.Categorical(logits=tok_logits).sample()  # [B]
-            else:
-                new_token = tok_logits.argmax(dim = -1) # [B]
             
-            x[torch.arange(batch_size), next_pos] = new_token
-
-            if stop_on_eos and eos_token_id is not None:
-                # Mark sequences as finished if they generated EOS
-                eos_generated = (new_token == eos_token_id)
-                if finished is not None:
-                    finished = finished | eos_generated
-
-        return x # [B, L]
+            if sample_token:
+                next_token = torch.distributions.Categorical(logits=tok_logits).sample()
+            else:
+                next_token = tok_logits.argmax(dim=-1)
+            
+            # Unmask
+            x[torch.arange(batch_size), next_pos] = next_token
+            
+            # Update lengths for unfinished sequences
+            lengths[~finished] += 1
+            
+            # Check for EOS
+            eos_generated = (next_token == eos_token_id) & ~finished
+            finished = finished | eos_generated
+        
+        # Replace remaining masks with pad token for unfinished sequences
+        still_masked = (x == self.mask_id)
+        x[still_masked] = pad_token_id
+        
+        # For sequences that never generated EOS, set length to max_len
+        lengths[lengths == 0] = max_len
+        
+        return x, lengths
                  
 
     @torch.no_grad()
@@ -137,6 +166,7 @@ class Model(nn.Module):
             h = self.encode(x)
             order_scores = self.order_head(h).squeeze(-1)
             masked_scores = order_scores.masked_fill(~M, float('-inf'))
+            # z is the index to unmask in the current generation step
             if sample_index:
                 z = torch.distributions.Categorical(logits=order_scores/temperature).sample()   # [B]
             else:
