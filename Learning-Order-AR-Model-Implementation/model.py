@@ -195,27 +195,12 @@ class Model(nn.Module):
             h = self.transformer(emb)
         else:
             h = self.transformer(emb)
-
-    # def encode(self, batch, use_mask = True):
-    #     #Batch, seq_len
-    #     B, L = batch.shape
-    #     pos = torch.arange(L, device = batch.device).unsqueeze(0).expand((B, L))
-    #     emb = self.tok_emb(batch) + self.pos_emb(pos)  # [B, L, d_model]
-    #     finished = finished | eos_generated
-        
-    #     # Replace remaining masks with pad token for unfinished sequences
-    #     still_masked = (x == self.mask_id)
-    #     x[still_masked] = pad_token_id
-        
-    #     # For sequences that never generated EOS, set length to max_len
-    #     lengths[lengths == 0] = max_len
-        
-    #     return x, lengths
-                 
+        return h 
 
     @torch.no_grad()
     def generate_2(self, x_init, max_steps, temperature=1.0,
         sample_index=False, sample_token=False, topk=None):
+        # WARNING: THIS IGNORES MASKING
 
         x = x_init.clone()
         B, L = x.shape
