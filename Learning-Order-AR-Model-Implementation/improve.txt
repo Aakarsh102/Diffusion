@@ -1,3 +1,6 @@
 # Things to improve 
-- Implement RLOO
+- visualize the token orderings
+- multiple ar generation steps 
+- Implement RLOO (done)
 - Implement better perplexity metric
+- implement nll 
