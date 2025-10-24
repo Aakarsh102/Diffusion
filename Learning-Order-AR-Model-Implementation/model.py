@@ -103,16 +103,16 @@ class Model(nn.Module):
             token_logits = self.token_head(h)
             order_logits = self.order_head(h).squeeze(dim = -1)
             mask = (x == self.mask_id)
-            if not m.any():
+            if not mask.any():
                 break
-            masked_order_logits = order_logits.fill(~mask, float('-inf'))
+            masked_order_logits = order_logits.masked_fill(~mask, float('-inf'))
             if sample_order:
                 probs = F.softmax(masked_order_logits/temperature, dim = -1)
                 next_pos = torch.multinomial(probs, num_samples = 1).squeeze(dim = -1)
             else:
                 next_pos = masked_order_logits.argmax(dim = -1)
 
-            seletected_tokens = token_logits[torch.arange(batch_size), next_pos]
+            selected_tokens = token_logits[torch.arange(batch_size), next_pos]
 
             if sample_token:
                 probs = F.softmax(selected_tokens/temperature, dim = -1)
@@ -124,7 +124,7 @@ class Model(nn.Module):
             l.append(next_pos)
 
 
-        return f"outputs = {x}, orderings = {l}"
+        return {"outputs": x, "orders": l}
 
 
     
