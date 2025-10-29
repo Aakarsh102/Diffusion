@@ -22,7 +22,7 @@ class Model(nn.Module):
         self.variational_policy = variational_policy
         self.layer = nn.TransformerEncoderLayer(d_model=self.d_model, 
                                                 nhead = self.n_heads, 
-                                                dim_feedforward=128, 
+                                                dim_feedforward=4 * self.d_model, 
                                                 device=self.device,
                                                 batch_first=True
                                                 )
@@ -91,6 +91,20 @@ class Model(nn.Module):
         else:
             h = self.transformer(emb)
         return h 
+
+    def encode_with_causal_mask(self, batch):
+        """Encode with proper causal attention mask"""
+        B, L = batch.shape
+        pos = torch.arange(L, device=batch.device).unsqueeze(0).expand((B, L))
+        emb = self.tok_emb(batch) + self.pos_emb(pos)
+        
+        # Create causal mask: position i can only attend to positions <= i
+        causal_mask = torch.triu(torch.ones(L, L, device=batch.device), diagonal=1).bool()
+        causal_mask = causal_mask.float().masked_fill(causal_mask, float('-inf'))
+        
+        h = self.transformer(emb, mask=causal_mask)
+        return h
+
     @torch.no_grad()
     def generate(self, batch_size, seq_len, temperature=1.0, 
             sample_order=True, sample_token=True):
@@ -111,6 +125,7 @@ class Model(nn.Module):
                 next_pos = torch.multinomial(probs, num_samples = 1).squeeze(dim = -1)
             else:
                 next_pos = masked_order_logits.argmax(dim = -1)
+            #next_pos += 1
 
             selected_tokens = token_logits[torch.arange(batch_size), next_pos]
 
@@ -126,7 +141,31 @@ class Model(nn.Module):
 
         return {"outputs": x, "orders": l}
 
-
+    @torch.no_grad()
+    def generate_ar(self, batch_size, seq_len, temperature=1.0):
+        """
+        Standard autoregressive generation for causal-trained models.
+        """
+        self.eval()
+        
+        # Start with BOS token or random token
+        x = torch.full((batch_size, 1), self.eos_id, dtype=torch.long, device=self.device)
+        
+        for step in range(seq_len - 1):
+            # Encode current sequence with causal mask
+            h = self.encode_with_causal_mask(x)
+            
+            # Get logits for the last position only
+            token_logits = self.token_head(h[:, -1, :])  # [batch_size, vocab_size]
+            
+            # Sample next token
+            probs = F.softmax(token_logits / temperature, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)  # [batch_size, 1]
+            
+            # Append to sequence
+            x = torch.cat([x, next_token], dim=1)
+        
+        return {"outputs": x, "orders": list(range(seq_len))}
     
     def create_attention_mask_per_batch(self, x):
         """
