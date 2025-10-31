@@ -15,6 +15,10 @@ from transformers import AutoTokenizer, set_seed
 from sklearn.model_selection import train_test_split
 
 from model import Model
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
+
 
 def get_cache_path(cache_dir, dataset_name, tokenizer_name, block_size):
     """Generate a unique cache path based on dataset config"""
@@ -36,7 +40,7 @@ def load_openwebtext(block_size=1024):
     ds = load_dataset("openwebtext", cache_dir = "/scratch/gilbreth/rai53/hf_cache")["train"].train_test_split(test_size=0.005, seed = 42)
     return {"train": ds["train"], "validation": ds["test"]}
 
-def tokenize_and_chunk(ds, tokenizer, block_size=1024, cache_dir="./data_cache"):
+def tokenize_and_chunk(ds, tokenizer, block_size=1024, cache_dir="./data_cache_64"):
     """
     Tokenize and chunk dataset with caching support
     
@@ -85,7 +89,7 @@ def tokenize_and_chunk(ds, tokenizer, block_size=1024, cache_dir="./data_cache")
         tokenized[split] = ds[split].map(
             tokenize_function,
             batched=True,
-            num_proc=64,
+            num_proc=128,
             remove_columns=ds[split].column_names,
             desc=f"Tokenizing {split}"
         )
@@ -120,7 +124,7 @@ def tokenize_and_chunk(ds, tokenizer, block_size=1024, cache_dir="./data_cache")
         chunked[split] = tokenized[split].map(
             group_texts,
             batched=True,
-            num_proc=64,
+            num_proc=128,
             desc=f"Chunking {split}"
         )
     
@@ -180,22 +184,13 @@ class DataCollatorOrderAR:
 
 def create_masked_input(x_target, orderings, num_positions, mask_id):
     """
-    Create masked input where first num_positions of each ordering are unmasked.
-    
-    Args:
-        x_target: [B, L] ground truth tokens
-        orderings: [B, num_positions] indices to unmask (first num_positions of full ordering)
-        num_positions: int, same for all samples in batch
-        mask_id: mask token id
-    
-    Returns:
-        x_masked: [B, L] with only specified positions unmasked
-        mask: [B, L] boolean (True = masked)
+    Works for scalar or per-sample num_positions (tensor of shape [B])
     """
-    x_masked = torch.full_like(x_target, mask_id)
     B, L = x_target.shape
+    x_masked = torch.full_like(x_target, mask_id)
     for b in range(B):
-        pos_to_unmask = orderings[b, :num_positions]
+        n = int(num_positions[b]) if torch.is_tensor(num_positions) else num_positions
+        pos_to_unmask = orderings[b, :n]
         x_masked[b, pos_to_unmask] = x_target[b, pos_to_unmask]
     mask = (x_masked == mask_id)
     return x_masked, mask
@@ -229,136 +224,14 @@ def generate_samples(model, tokenizer, device, num_samples=4, seq_len=128, tempe
     )
     
     # Decode samples
+    orders = samples["orders"]
     texts = []
-    for sample in samples:
+    for sample in samples["outputs"]:
         text = tokenizer.decode(sample, skip_special_tokens=True)
         texts.append(text)
     
-    return texts
+    return texts, orders
 
-
-""" 
-#def train_step_autoregressive(model, x_in, x_target, not_pad, device, num_ar_steps=5):
-#    Autoregressive training step that simulates the generation process
-#    
-#    Args:
-#        num_ar_steps: Number of autoregressive unmasking steps per training iteration
-    #print("x_in:", x_in)
-
-    total_tok_loss = 0.0
-    total_ord_loss = 0.0
-
-    x_current = x_in.clone()
-    num_steps = 0
-    B = x_in.size(0)
-    for step in range(num_ar_steps):
-        M = (x_current == model.mask_id)
-        if not M.any():
-            break
-        has_masks = M.any(dim=1)  # [B] - True if sample has any masks
-        num_with_masks = has_masks.sum().item()
-        has_masks = (M.sum(dim = -1) > 1) & has_masks
-
-        if num_with_masks == 0:
-            break
-
-        x_fwd = x_current.clone()
-        h = model.encode(x_fwd, use_mask=False)
-        
-        # Get token predictions and order scores
-        logits_tok = model.token_head(h)  # [B, L, V]
-        order_scores = model.order_head(h).squeeze(-1)  # [B, L]
-        
-        # Compute order policy distribution over masked positions
-        order_scores_masked = order_scores.masked_fill(~M, float('-inf'))
-        
-
-        next_pos = torch.zeros(B, dtype=torch.long, device = x_in.device)
-        valid_order_scores = order_scores_masked[has_masks]
-        valid_probs = F.softmax(valid_order_scores, dim=-1)
-       
-#        if torch.isnan(valid_probs).any():
-#            print(f"Warning: NaN in valid_probs at step {step}")
-#            # For debugging - let's see what's happening
-#            print(f"valid_order_scores min: {valid_order_scores.min()}, max: {valid_order_scores.max()}")
-#            print(f"has_masks sum: {has_masks.sum()}")
-#            print(f"(I added) valid order scores: {valid_order_scores}")
-#            print(f"(I added) valid probs: {valid_probs}")
-
-
-        valid_next_pos = torch.multinomial(valid_probs, num_samples=1).squeeze(-1)
-        next_pos[has_masks] = valid_next_pos
-
-
-
-        order_probs = F.softmax(order_scores_masked, dim=-1)  # [B, L]
-        # Sample next position to unmask from the order policy
-        # During training, we sample to explore different orderings
-        next_pos = torch.multinomial(order_probs, num_samples=1).squeeze(-1)  # [B]
-        
-        # Compute token loss for the selected positions
-        B = x_target.size(0)
-        selected_logits = logits_tok[torch.arange(B), next_pos]  # [B, V]
-        selected_targets = x_target[torch.arange(B), next_pos]  # [B]
-        
-        tok_loss = F.cross_entropy(selected_logits[has_masks], selected_targets[has_masks], reduction='mean')
-        
-        with torch.cuda.amp.autocast(enabled=False):
-            with torch.no_grad():
-                all_probs = F.softmax(logits_tok, dim=-1)  # [B, L, V]
-                if torch.isnan(all_probs).any():
-                    print("Warning: NaN in all_probs")
-                ent = - torch.sum(all_probs * torch.log(all_probs + 1e-9), dim = -1)
-                #ent = torch.clamp(ent, max=20.0)
-                #ent = ent.masked_fill(~M, float('inf'))  # only masked compete
-                ent = ent.masked_fill(~M, 100)  # only masked compete
-                target = torch.zeros_like(ent)
-                if has_masks.any():
-                    target[has_masks] = torch.softmax(-ent[has_masks], dim = -1)
-                    
-                
-
-                
-            if has_masks.any():
-                order_logprobs = order_scores_masked[has_masks].log_softmax(dim = -1) # (B, L)
-                order_loss = F.kl_div(
-                    order_logprobs, 
-                    target[has_masks], 
-                    reduction='batchmean'
-                )
-            else:
-                order_loss = torch.tensor(0.0, device = x_in.device)
-        #order_logprobs = order_scores_masked.log_softmax(-1)  # [B, L]
-        #order_loss = F.kl_div(order_logprobs, target, reduction='batchmean')
-
-        total_tok_loss += tok_loss
-        total_ord_loss += order_loss
-        num_steps += 1
-
-        x_next = x_current.clone()
-        x_next[torch.arange(B), next_pos] = x_target[torch.arange(B), next_pos]
-        x_current=x_next.detach();
-        #x_current[torch.arange(B), next_pos] = x_target[torch.arange(B), next_pos]
-
-    if num_steps == 0:
-        return {
-            "loss": torch.tensor(0.0, device=device),
-            "token_loss": torch.tensor(0.0, device=device),
-            "order_loss": torch.tensor(0.0, device=device)
-        }
-    
-    avg_tok_loss = total_tok_loss / num_steps
-    avg_ord_loss = total_ord_loss / num_steps
-    total_loss = avg_tok_loss + model.order_weight * avg_ord_loss
-    
-    return {
-        "loss": total_loss,
-        "token_loss": avg_tok_loss.detach(),
-        "order_loss": avg_ord_loss.detach()
-    }
-
-
-"""
 
 
 def train_step_autoregressive(model, x_in, x_target, not_pad, device, num_ar_steps=5):
@@ -389,7 +262,7 @@ def train_step_autoregressive(model, x_in, x_target, not_pad, device, num_ar_ste
         # Sample positions
         next_pos = torch.zeros(B, dtype=torch.long, device=x_in.device)
         valid_order_scores = order_scores_masked[has_masks]
-        valid_probs = F.softmax(valid_order_scores.float(), dim=-1)
+        valid_probs = F.softmax(valid_order_scores, dim=-1)
         valid_next_pos = torch.multinomial(valid_probs, num_samples=1).squeeze(-1)
         next_pos[has_masks] = valid_next_pos
 
@@ -409,7 +282,7 @@ def train_step_autoregressive(model, x_in, x_target, not_pad, device, num_ar_ste
         
         if valid_for_order.any():
             with torch.no_grad():
-                logits_fp32 = logits_tok[valid_for_order].float()
+                logits_fp32 = logits_tok[valid_for_order]
                 M_valid = M[valid_for_order]
                 
                 all_probs = F.softmax(logits_fp32, dim=-1)
@@ -422,7 +295,7 @@ def train_step_autoregressive(model, x_in, x_target, not_pad, device, num_ar_ste
                 target_valid = F.softmax(-ent_masked, dim=-1)
             
             # Get order scores for valid samples
-            order_scores_valid = order_scores[valid_for_order].float()
+            order_scores_valid = order_scores[valid_for_order]
             order_scores_masked_valid = order_scores_valid.masked_fill(~M_valid, -1000000.0)  # Use -100 instead of -inf
             
             # Compute log probabilities
@@ -498,89 +371,336 @@ def compute_log_q_ordering(model, x_target, ordering_prefix, q_logits = None):
 
     for s in range(S):
         q_logprobs = F.log_softmax(q_logits.masked_fill(~mask, float('-inf')), dim=-1)  # [B, L]
+        #q_logprobs = F.log_softmax(q_logits.masked_fill(~mask, float(-100)), dim=-1)  # [B, L]
+
         idx = ordering_prefix[:, s]  # [B]
         log_q_total += q_logprobs[torch.arange(B, device=device), idx]
         mask[torch.arange(B, device=device), idx] = False  # remove chosen index
 
     return log_q_total
 
-def compute_F_theta(model, x_masked, x_target, mask, ordering_prefix, device, q_logits = None):
-    """
-    x_masked: [B,L] - only z_<i positions revealed, others are mask_id
-    mask:     [B,L] - True where still masked (eligible k ∈ z_{≥i})
-    returns:  F_theta per sample, shape [B]
-    """
 
-    B, L = x_target.shape
+def compute_F_theta(model, x_masked, x_target, mask, q_logits):
+    #if torch.isnan(q_logits).any():
+    #    print("NaN in q_logits before masking!")
 
-    # qθ over full x
-   # q_logits_full = model.get_variational_logits(x_target).float()  # [B,L]
-    q_logits_full = q_logits.float()
-    q_logits_masked = q_logits_full.masked_fill(~mask, float('-inf'))
-    q_logprobs = F.log_softmax(q_logits_masked, dim=-1)             # [B,L]
+    # q part (detached to stop pathwise grads)
+    q_logits_masked = q_logits.masked_fill(~mask, float('-inf'))
+    q_logprobs = F.log_softmax(q_logits_masked, dim=-1)
     q_probs    = q_logprobs.exp()
+    #if (~mask).all(dim=1).any():
+    #    print("Empty mask row detected!")
 
-    h_masked = model.encode(x_masked, use_mask=False)               # [B,L,d]
-    p_logits = model.order_head(h_masked).squeeze(-1).float()       # [B,L]
-    p_logits_masked = p_logits.masked_fill(~mask, float('-inf'))
-    p_logprobs = F.log_softmax(p_logits_masked, dim=-1)
 
-    token_logits = model.token_head(h_masked).float()               # [B,L,V]
-    logp_all = F.log_softmax(token_logits, dim=-1)                  # [B,L,V]
-    gold_logp = logp_all.gather(-1, x_target.unsqueeze(-1)).squeeze(-1)  # [B,L]
+    h = model.encode(x_masked, use_mask=False)
+    p_logits = model.order_head(h).squeeze(-1)
+    p_logprobs = F.log_softmax(p_logits.masked_fill(~mask,float('-inf')), dim=-1) #p_theta(z_i|z_i < i, x < i)
+    #if torch.isnan(q_logits).any():
+    #    print("NaN in q_logits before masking!")
+    #if torch.isnan(p_logprobs).any():
+    #    print("NaN in p_logprobs")
+
+    tok_logits = model.token_head(h)
+    logp_all = F.log_softmax(tok_logits, dim=-1)
+    #if torch.isnan(p_logprobs).any():
+    #    print("NaN in p_logprobs")
+    gold_logp = logp_all.gather(-1, x_target.unsqueeze(-1)).squeeze(-1)
     token_logprobs = torch.where(mask, gold_logp, torch.zeros_like(gold_logp))
+    #if torch.isnan(p_logprobs).any():
+    #    print("NaN in p_logprobs")
 
-    # Fθ = Σ_k q(k) * [log p(k) + log p(x_k) - log q(k)]
-    F_theta = (q_probs * (p_logprobs + token_logprobs - q_logprobs)).sum(dim=-1)  # [B]
+    # --- before summing ---
+    valid = mask  # True where masked (eligible positions)
+    term = q_probs * (p_logprobs + token_logprobs - q_logprobs)
+    term = torch.where(valid, term, torch.zeros_like(term))  # zero-out masked-out
+    F_theta = term.sum(dim=-1)
+
+    # final safe cleanup
+    #F_theta = torch.nan_to_num(F_theta, nan=0.0, posinf=0.0, neginf=0.0)
     return F_theta
 
+   
+    return (q_probs * (p_logprobs + token_logprobs - q_logprobs)).sum(dim=-1)  # [B]
+
+
+def create_masked_input_varlen(x_target, z_full, i_vec, mask_id):
+    # x_target: [B,L], z_full: [B,L] (permutation indices), i_vec: [B]
+    x_masked = torch.full_like(x_target, mask_id)
+    B, L = x_target.shape
+    for b in range(B):
+        k = int(i_vec[b].item())
+        idx = z_full[b, :k]                 # first k positions in the ordering
+        x_masked[b, idx] = x_target[b, idx]
+    mask = x_masked.eq(mask_id)             # True where still masked
+    return x_masked, mask
+
+def compute_log_q_prefix_varlen(q_logits, z_full, i_vec):
+    # q_logits: [B,L], z_full: [B,L], i_vec: [B]
+    B, L = q_logits.shape
+    device = q_logits.device
+    log_q_total = torch.zeros(B, device=device)
+    # per-sample remaining-set mask
+    remain = torch.ones(B, L, dtype=torch.bool, device=device)
+    for s in range(int(i_vec.max().item())):
+        # only update samples where s < i[b]
+        active = (i_vec > s)
+        if not active.any(): break
+        #q_logprobs = F.log_softmax(q_logits.masked_fill(~remain, -1000), dim=-1)  # [B,L]
+        q_logprobs = F.log_softmax(q_logits.masked_fill(~remain, float('-inf')), dim=-1)  # [B,L]
+        idx_s = z_full[active, s]                          # [B_active]
+        log_q_total[active] += q_logprobs[active, idx_s]
+        remain[active, idx_s] = False
+
+    #log_q_avg = log_q_total / i_vec.float()  # Average log prob per step
+    #return log_q_avg
+    return log_q_total
+
+
+# def train_step_rloo(model, x_target, device, seq_len):
+#     """
+#     RLOO training step with SAME number of unmasked positions across batch.
+#     """
+#     B, L = x_target.shape
+#     mask_id = model.mask_id
+#     q_logits = model.get_variational_logits(x_target)  # [B, L]
+#      # Step 1: Sample ONE random step i for entire batch
+#      #i = random.randint(1, L - 1)  # Single integer, not per-sample!
+#     i_vec = torch.randint(1, L, (B,), device=x_target.device)
+#     with torch.no_grad():
+#          # q_logits = model.get_variational_logits(x_target)  # [B, L]
+        
+#          # Each sample gets its own ordering
+#         z1_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
+#         z2_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
+
+#      #z1_prefix = z1_full[:, :x]  # [B, x] - all samples have x unmasked (x is different for each)
+#      #z2_prefix = z2_full[:, :x]  # [B, x] - all samples have x unmasked (x is different for each) 
+#      #x_masked_1, mask_1 = create_masked_input(x_target, z1_prefix, x, mask_id)
+#      #x_masked_2, mask_2 = create_masked_input(x_target, z2_prefix, x, mask_id)
+#     x_masked_1, mask_1 = create_masked_input_varlen(x_target, z1_full, i_vec, mask_id)
+#     x_masked_2, mask_2 = create_masked_input_varlen(x_target, z2_full, i_vec, mask_id)
+
+#     q_logits_det   = q_logits.detach()
+#     F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, q_logits=q_logits_det)
+#     F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, q_logits=q_logits_det)
+#      #F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, z1_prefix, device, q_logits=q_logits_det)
+#      #F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, z2_prefix, device, q_logits=q_logits_det)
+
+#      #log_q1 = compute_log_q_ordering(model, x_target, z1_prefix, q_logits=q_logits)
+#      #log_q2 = compute_log_q_ordering(model, x_target, z2_prefix, q_logits=q_logits)
+#     log_q1 = compute_log_q_prefix_varlen(q_logits, z1_full, i_vec)     # grads to q
+#     log_q2 = compute_log_q_prefix_varlen(q_logits, z2_full, i_vec)
+
+#     Delta_F = F1 - F2
+#      #delta_F = Delta_F - Delta_F.mean()               # center over batch
+#      #Delta_F = torch.clamp(delta_F, -1.0, 1.0)
+#     loss = - torch.mean(
+#         (log_q1 - log_q2) * Delta_F.detach() + F1 + F2
+#     )
+
+#     return {
+#          "loss": loss,                        # The actual training loss
+#          "F1": F1.mean().detach(),           # F_theta for ordering 1
+#          "F2": F2.mean().detach(),           # F_theta for ordering 2
+#          "log_q1": log_q1.mean().detach(),   # Log prob of ordering 1
+#          "log_q2": log_q2.mean().detach(),   # Log prob of ordering 2
+#          "Delta_F": Delta_F.mean().detach(), # Difference (for RLOO baseline)
+#          "Delta_F_std": Delta_F.std().item(),
+#          "num_unmasked": int(round(i_vec.float().mean().item()))
+#     }
 
 def train_step_rloo(model, x_target, device, seq_len):
-    """
-    RLOO training step with SAME number of unmasked positions across batch.
-    """
-    B, L = x_target.shape
-    mask_id = model.mask_id
-    q_logits = model.get_variational_logits(x_target)  # [B, L]
-    # Step 1: Sample ONE random step i for entire batch
-    i = random.randint(1, L - 1)  # Single integer, not per-sample!
-    with torch.no_grad():
-        # q_logits = model.get_variational_logits(x_target)  # [B, L]
-        
-        # Each sample gets its own ordering
-        z1_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
-        z2_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
+   """
+   RLOO training step with SAME number of unmasked positions across batch.
+   """
+   B, L = x_target.shape
+   mask_id = model.mask_id
+   q_logits = model.get_variational_logits(x_target)  # [B, L]
+   
+   # CHANGE: Single i for entire batch
+   i = random.randint(1, L - 1)  # Single integer
+   
+   with torch.no_grad():
+       z1_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
+       z2_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
+   
+   # CHANGE: Extract same prefix length for all samples
+   z1_prefix = z1_full[:, :i]  # [B, i]
+   z2_prefix = z2_full[:, :i]  # [B, i]
+   
+   # CHANGE: Use simpler create_masked_input with scalar i
+   x_masked_1, mask_1 = create_masked_input(x_target, z1_prefix, i, mask_id)
+   x_masked_2, mask_2 = create_masked_input(x_target, z2_prefix, i, mask_id)
 
-    z1_prefix = z1_full[:, :i]  # [B, i] - all samples have i unmasked
-    z2_prefix = z2_full[:, :i]  # [B, i] - all samples have i unmasked
-    x_masked_1, mask_1 = create_masked_input(x_target, z1_prefix, i, mask_id)
-    x_masked_2, mask_2 = create_masked_input(x_target, z2_prefix, i, mask_id)
-    q_logits_det   = q_logits.detach()
-    F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, z1_prefix, device, q_logits=q_logits_det)
-    F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, z2_prefix, device, q_logits=q_logits_det)
+   q_logits_det = q_logits.detach()
+   F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, q_logits=q_logits_det)
+   F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, q_logits=q_logits_det)
 
-    log_q1 = compute_log_q_ordering(model, x_target, z1_prefix, q_logits=q_logits)
-    log_q2 = compute_log_q_ordering(model, x_target, z2_prefix, q_logits=q_logits)
+   # CHANGE: Use simpler compute_log_q_ordering
+   log_q1 = compute_log_q_ordering(model, x_target, z1_prefix, q_logits=q_logits)
+   log_q2 = compute_log_q_ordering(model, x_target, z2_prefix, q_logits=q_logits)
 
-    Delta_F = F1 - F2
-    loss = -(L / 2.0) * torch.mean(
-        (log_q1 - log_q2) * Delta_F.detach() + F1 + F2
-    )
+   Delta_F = F1 - F2
+   loss = - torch.mean(
+       ((log_q1 - log_q2) / i) * Delta_F.detach() + F1 + F2
+   )
 
-    return {
-        "loss": loss,                        # The actual training loss
-        "F1": F1.mean().detach(),           # F_theta for ordering 1
-        "F2": F2.mean().detach(),           # F_theta for ordering 2
-        "log_q1": log_q1.mean().detach(),   # Log prob of ordering 1
-        "log_q2": log_q2.mean().detach(),   # Log prob of ordering 2
-        "Delta_F": Delta_F.mean().detach(), # Difference (for RLOO baseline)
-        "num_unmasked": i 
-    }
+   return {
+       "loss": loss,
+       "F1": F1.mean().detach(),
+       "F2": F2.mean().detach(),
+       "log_q1": log_q1.mean().detach(),
+       "log_q2": log_q2.mean().detach(),
+       "Delta_F": Delta_F.mean().detach(),
+       "Delta_F_std": Delta_F.std().item(),
+       "num_unmasked": i  # CHANGE: Just return scalar i
+   }
+# def train_step_rloo_logger(model, x_target, device, seq_len, debug_step=None):
+#     """
+#     RLOO with full debugging output.
+#     """
+#     B, L = x_target.shape
+#     mask_id = model.mask_id
+
+#     # Get variational policy logits
+#     q_logits = model.get_variational_logits(x_target)  # [B, L]
+
+#     # Sample same i for entire batch
+#     i = random.randint(1, L - 1)
+
+#     # Sample two orderings
+#     with torch.no_grad():
+#         z1_full = model.sample_ordering_gumbel(q_logits)
+#         z2_full = model.sample_ordering_gumbel(q_logits)
+
+#     z1_prefix = z1_full[:, :i]
+#     z2_prefix = z2_full[:, :i]
+
+#     # Create masked inputs
+#     x_masked_1, mask_1 = create_masked_input(x_target, z1_prefix, i, mask_id)
+#     x_masked_2, mask_2 = create_masked_input(x_target, z2_prefix, i, mask_id)
+
+#     # Compute F values
+#     q_logits_det = q_logits.detach()
+#     F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, q_logits=q_logits_det)
+#     F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, q_logits=q_logits_det)
+
+#     # Compute log probabilities
+#     log_q1 = compute_log_q_ordering(model, x_target, z1_prefix, q_logits=q_logits)
+#     log_q2 = compute_log_q_ordering(model, x_target, z2_prefix, q_logits=q_logits)
+
+#     Delta_F = F1 - F2
+
+#     # Loss with proper normalization
+#     loss = -  torch.mean(
+#         ((log_q1 - log_q2)) * Delta_F.detach() + F1 + F2
+#     )
+
+#     # ============================================================
+#     # DEBUGGING OUTPUT
+#     # ============================================================
+#     if debug_step is not None and (debug_step % 50 == 0):
+#         with torch.no_grad():
+#             # Check ordering diversity
+#             same_first = (z1_full[:, 0] == z2_full[:, 0]).float().mean().item()
+
+#             # Check prefix overlap
+#             overlap_count = 0
+#             for b in range(min(B, 4)):
+#                 z1_set = set(z1_prefix[b].cpu().tolist())
+#                 z2_set = set(z2_prefix[b].cpu().tolist())
+#                 overlap_count += len(z1_set & z2_set)
+#             avg_overlap = overlap_count / min(B, 4) / i
+
+#             # Check q_logits statistics
+#             q_probs = F.softmax(q_logits, dim=-1)
+#             q_entropy = -(q_probs * F.log_softmax(q_logits, dim=-1)).sum(dim=-1).mean().item()
+#             q_max_prob = q_probs.max(dim=-1)[0].mean().item()
+
+#             # Check F values distribution
+#             f1_mean = F1.mean().item()
+#             f1_std = F1.std().item()
+#             f2_mean = F2.mean().item()
+#             f2_std = F2.std().item()
+#             delta_f_mean = Delta_F.mean().item()
+#             delta_f_std = Delta_F.std().item()
+
+#             # Check log_q values
+#             log_q1_mean = log_q1.mean().item()
+#             log_q2_mean = log_q2.mean().item()
+#             log_q_per_step_1 = log_q1_mean / i
+#             log_q_per_step_2 = log_q2_mean / i
+
+#             # Check model policy at first masked position
+#             h1 = model.encode(x_masked_1, use_mask=False)
+#             p_logits_1 = model.order_head(h1).squeeze(-1)
+#             p_logits_masked_1 = p_logits_1.masked_fill(~mask_1, float('-inf'))
+#             p_probs_1 = F.softmax(p_logits_masked_1, dim=-1)
+#             # Better:
+#             valid_mask = (p_probs_1 > 0)
+#             p_logprobs = F.log_softmax(p_logits_masked_1, dim=-1)
+#             p_entropy_1 = -(p_probs_1[valid_mask] * p_logprobs[valid_mask]).sum() / valid_mask.sum()
+#             #p_entropy_1 = -(p_probs_1 * F.log_softmax(p_logits_masked_1, dim=-1)).sum(dim=-1).mean().item()
+
+#             print(f"\n{'='*70}")
+#             print(f"DEBUG @ Step {debug_step}")
+#             print(f"{'='*70}")
+#             print(f"Sequence info:")
+#             print(f"  i (num unmasked): {i}")
+#             print(f"  L (seq length): {L}")
+#             print(f"  Masked positions: {mask_1.sum().item() / B:.1f} avg per sample")
+
+#             print(f"\nOrdering diversity:")
+#             print(f"  Same first position: {same_first:.3f} (should be < 0.5)")
+#             print(f"  Avg prefix overlap: {avg_overlap:.3f} (should be < 0.5)")
+#             print(f"  z1[0,:5]: {z1_prefix[0, :5].tolist()}")
+#             print(f"  z2[0,:5]: {z2_prefix[0, :5].tolist()}")
+
+#             print(f"\nVariational policy (q):")
+#             print(f"  Entropy: {q_entropy:.2f} / {math.log(L):.2f} (max)")
+#             print(f"  Max prob: {q_max_prob:.4f} (uniform would be {1/L:.4f})")
+#             print(f"  Top-5 probs: {q_probs[0].topk(5)[0].tolist()}")
+
+#             print(f"\nModel policy (p) at first sample:")
+#             print(f"  Entropy: {p_entropy_1:.2f} / {math.log(mask_1[0].sum().item()):.2f} (max)")
+
+#             print(f"\nF values:")
+#             print(f"  F1: {f1_mean:.4f} ± {f1_std:.4f}")
+#             print(f"  F2: {f2_mean:.4f} ± {f2_std:.4f}")
+#             print(f"  Delta_F: {delta_f_mean:.4f} ± {delta_f_std:.4f}")
+#             print(f"  |Delta_F| / |F1|: {abs(delta_f_mean) / (abs(f1_mean) + 1e-6):.4f}")
+
+#             print(f"\nLog probabilities:")
+#             print(f"  log_q1: {log_q1_mean:.2f} (per step: {log_q_per_step_1:.4f})")
+#             print(f"  log_q2: {log_q2_mean:.2f} (per step: {log_q_per_step_2:.4f})")
+#             print(f"  Prob per step: {math.exp(log_q_per_step_1):.4f}, {math.exp(log_q_per_step_2):.4f}")
+
+#             print(f"\nLoss components:")
+#             reinforce_term = ((log_q1 - log_q2) / L * Delta_F.detach()).mean().item()
+#             pathwise_term = (F1 + F2).mean().item()
+#             print(f"  REINFORCE term: {reinforce_term:.4f}")
+#             print(f"  Pathwise term: {pathwise_term:.4f}")
+#             print(f"  Total loss: {loss.item():.4f}")
+
+#             print(f"{'='*70}\n")
+
+#     return {
+#         "loss": loss,
+#         "F1": F1.mean().detach(),
+#         "F2": F2.mean().detach(),
+#         "log_q1": log_q1.mean().detach(),
+#         "log_q2": log_q2.mean().detach(),
+#         "Delta_F": Delta_F.mean().detach(),
+#         "Delta_F_std": Delta_F.std().item(),
+#         "num_unmasked": i
+#     }
 
 
+# In your training loop, pass the step number:
+# out = train_step_rloo(model, x_target, device, config["block_size"], debug_step=global_step)
 
 def main(config):
-    set_seed(config["seed"])
+    set_seed(config['seed'])
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
@@ -606,7 +726,8 @@ def main(config):
         batch_size=config["batch_size"],
         shuffle=True,
         collate_fn=collator,
-        num_workers=2,
+        num_workers=8,
+        persistent_workers=True, prefetch_factor=4,
         pin_memory=True,
     )
     val_loader = DataLoader(
@@ -614,7 +735,8 @@ def main(config):
         batch_size=config["eval_batch_size"],
         shuffle=False,
         collate_fn=collator,
-        num_workers=2,
+        num_workers=8,
+        persistent_workers=True, prefetch_factor=4,
         pin_memory=True,
     )
 
@@ -628,17 +750,26 @@ def main(config):
         device=device,  # Pass device to model
         variational_policy=config.get("variational_policy", "shared_torso")
     ).to(device)
+    #model.load_state_dict(torch.load("./pretrained.pth"))
+    state_dict = torch.load("./pretrained.pth", map_location=device)
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict, strict=True)
+
 
     model.eos_id = eos_id
     model.pad_id = pad_id
+    model = torch.compile(model)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr = config["lr"], betas=(0.9, 0.95), weight_decay=1e-3)
+    optimizer = torch.optim.AdamW(model.parameters(), lr = config["lr"], betas=(0.9, 0.95), weight_decay=1e-3, fused=True)
     scaler = torch.cuda.amp.GradScaler(enabled=(device=="cuda"))
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     global_step = 0
     best_val_nll = float("inf")
+    #best_val_nll = 100000
     for epoch in range(config["epochs"]):
         model.train()
         running = {
@@ -675,7 +806,12 @@ def main(config):
             running["Delta_F"] += out["Delta_F"].item()
             step_counts[out["num_unmasked"] - 1] += 1
 
-            if (it + 1) % 50 == 0:
+            if it % 50000 == 0:
+                save_path = "/scratch/gilbreth/rai53/diffusion/Diffusion/Learning-Order-AR-Model-Implementation/models/train_latest.pth"
+                to_save = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
+                torch.save(to_save, save_path)
+
+            if (it) % 50 == 0:
                 for key in running:
                     running[key] /= 50
                 
@@ -688,9 +824,18 @@ def main(config):
                     "train/Delta_F": running["Delta_F"],
                     "train/step": global_step
                 })
+                k = out["Delta_F_std"]
                 print(f"Step {global_step}: loss={running['loss']:.4f}, "
                     f"F1={running['F1']:.4f}, F2={running['F2']:.4f}, "
-                    f"log_q1={running['log_q1']:.4f}, Delta_F={running['Delta_F']:.4f}")
+                    f"log_q1={running['log_q1']:.4f}, Delta_F={running['Delta_F']:.4f}, Delta_F_std: {k}")
+                if (it % 500) == 0:
+                    print("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%")
+                    samples, orderings = generate_samples(model, tokenizer, device)
+                    for i in range(len(samples)):
+                        print(samples[i])
+                    print("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%")
+                   # print(orderings)
+                print("#"*25)
             
             # Reset
                 running = {k: 0.0 for k in running}
@@ -727,20 +872,20 @@ if __name__ == "__main__":
     CONFIG = {
         "wandb_project": "order-ar-openwebtext",
         "model_name": "gpt2",
-        "block_size": 512,           # try 1024 if you have VRAM
-        "batch_size": 2,
+        "block_size": 64,           # try 1024 if you have VRAM
+        "batch_size": 32,
         "eval_batch_size": 2,
         "epochs": 3,
-        "lr": 3e-4,
+        "lr": 1e-5,
         "mask_prob": [1, 0.15,0.15,0.15, 0.2, 0.5, 0.15, 0.15, 0.7, 0.9, 1],
         "seed": 42,
         "eval_stride": 32,
         "eval_pppl_batches": 25,
         "wandb_mode": "online",      # or "offline"
-        # model dims
-        "d_model": 384,
+        # model dims384
+        "d_model": 512,
         "n_layers": 6,
-        "n_heads": 6,
+        "n_heads": 8,
         "num_ar_steps": 10,        # number of autoregressive unmasking steps per training iteration
         "cache_dir": "./data_cache",
         "variational_policy": "shared_torso"  # or "separate_heads"
