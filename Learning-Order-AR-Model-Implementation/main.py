@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
+import torch.optim.lr_scheduler as lr_scheduler
 import wandb
 from datasets import load_dataset, DatasetDict, load_from_disk
 from transformers import AutoTokenizer, set_seed
@@ -40,7 +41,7 @@ def load_openwebtext(block_size=1024):
     ds = load_dataset("openwebtext", cache_dir = "/scratch/gilbreth/rai53/hf_cache")["train"].train_test_split(test_size=0.005, seed = 42)
     return {"train": ds["train"], "validation": ds["test"]}
 
-def tokenize_and_chunk(ds, tokenizer, block_size=1024, cache_dir="./data_cache_64"):
+def tokenize_and_chunk(ds, tokenizer, block_size=1024, cache_dir="./data_cache"):
     """
     Tokenize and chunk dataset with caching support
     
@@ -195,6 +196,29 @@ def create_masked_input(x_target, orderings, num_positions, mask_id):
     mask = (x_masked == mask_id)
     return x_masked, mask
 
+
+#def create_masked_input(x_target, orderings, num_positions, mask_id):
+#    """
+#    Create masked input where first num_positions of each ordering are unmasked.
+#    
+#    Args:
+#        x_target: [B, L] ground truth tokens
+#        orderings: [B, num_positions] indices to unmask (first num_positions of full ordering)
+#        num_positions: int, same for all samples in batch
+#        mask_id: mask token id
+#    
+#    Returns:
+#        x_masked: [B, L] with only specified positions unmasked
+#        mask: [B, L] boolean (True = masked)
+#    """
+#    x_masked = torch.full_like(x_target, mask_id)
+#    B, L = x_target.shape
+#    for b in range(B):
+#        pos_to_unmask = orderings[b, :num_positions[b]]             # changed for varying masks across a batch
+#        x_masked[b, pos_to_unmask] = x_target[b, pos_to_unmask]    
+#    mask = (x_masked == mask_id)
+#    return x_masked, mask
+
     
 @torch.no_grad()
 def eval_masked_nll(model, data_loader, device):
@@ -210,16 +234,17 @@ def eval_masked_nll(model, data_loader, device):
     return mean_nll, ppl
 
 @torch.no_grad()
-def generate_samples(model, tokenizer, device, num_samples=4, seq_len=128, temperature=0.9):
+def generate_samples(model, tokenizer, device, num_samples=4, seq_len=128, temperature=0.9, sample = None):
     """Generate sample sequences for qualitative evaluation"""
     model.eval()
-    
+    sample_batch = sample["x_target"][:4].to(device)
     samples = model.generate(
         batch_size=num_samples,
         seq_len=seq_len,
         temperature=temperature,
         sample_order=True,
         sample_token=True,
+        sample = sample_batch
         #use_attention_mask=True
     )
     
@@ -252,7 +277,8 @@ def train_step_autoregressive(model, x_in, x_target, not_pad, device, num_ar_ste
         if num_with_masks == 0:
             break
 
-        h = model.encode(x_current, use_mask=False)
+        #h = model.encode(x_current, use_mask=False)
+        h = model.encode(x_current, use_mask=True)
         
         logits_tok = model.token_head(h)
         order_scores = model.order_head(h).squeeze(-1)
@@ -392,9 +418,10 @@ def compute_F_theta(model, x_masked, x_target, mask, q_logits):
     #    print("Empty mask row detected!")
 
 
-    h = model.encode(x_masked, use_mask=False)
+    #h = model.encode(x_masked, use_mask=False)
+    h = model.encode(x_masked, use_mask = True)
     p_logits = model.order_head(h).squeeze(-1)
-    p_logprobs = F.log_softmax(p_logits.masked_fill(~mask,float('-inf')), dim=-1) #p_theta(z_i|z_i < i, x < i)
+    p_logprobs = F.log_softmax(p_logits.masked_fill(~mask,float('-inf')), dim=-1)
     #if torch.isnan(q_logits).any():
     #    print("NaN in q_logits before masking!")
     #if torch.isnan(p_logprobs).any():
@@ -438,262 +465,302 @@ def compute_log_q_prefix_varlen(q_logits, z_full, i_vec):
     # q_logits: [B,L], z_full: [B,L], i_vec: [B]
     B, L = q_logits.shape
     device = q_logits.device
-    log_q_total = torch.zeros(B, device=device)
-    # per-sample remaining-set mask
-    remain = torch.ones(B, L, dtype=torch.bool, device=device)
-    for s in range(int(i_vec.max().item())):
-        # only update samples where s < i[b]
-        active = (i_vec > s)
-        if not active.any(): break
-        #q_logprobs = F.log_softmax(q_logits.masked_fill(~remain, -1000), dim=-1)  # [B,L]
-        q_logprobs = F.log_softmax(q_logits.masked_fill(~remain, float('-inf')), dim=-1)  # [B,L]
-        idx_s = z_full[active, s]                          # [B_active]
-        log_q_total[active] += q_logprobs[active, idx_s]
-        remain[active, idx_s] = False
+    max_i = int(i_vec.max().item())
+    
+    if max_i == 0:
+        return torch.zeros(B, device = device)
 
-    #log_q_avg = log_q_total / i_vec.float()  # Average log prob per step
-    #return log_q_avg
+    z_prefix = z_full[:, :max_i]  #(B, max_i)
+
+    steps = torch.arange(max_i, device = device).unsqueeze(0)
+    valid = steps < i_vec.unsqueeze(1)
+    pos_ids = torch.arange(L, device=device).reshape(1, 1, L)
+    z_expanded = z_prefix.unsqueeze(2)  # [B, max_i, 1]
+
+    is_chosen_at_step = (z_expanded == pos_ids)  # [B, max_i, L]
+
+    # Cumulative sum to track which positions are taken
+    chosen_before = torch.cumsum(is_chosen_at_step, dim=1)  # [B, max_i, L]
+    chosen_before = torch.cat([
+        torch.zeros(B, 1, L, device=device, dtype=chosen_before.dtype),
+        chosen_before[:, :-1, :]
+    ], dim=1)  # [B, max_i, L]
+
+    available = (chosen_before == 0)
+    q_logits_exp = q_logits.unsqueeze(1).expand(B, max_i, L)
+    masked_logits = torch.where(available, q_logits_exp, torch.tensor(float('-inf'), device=device))
+    log_probs = F.log_softmax(masked_logits, dim=-1)  # [B, max_i, L]
+
+    # Gather log probs for selected positions
+    selected = log_probs.gather(2, z_prefix.unsqueeze(-1)).squeeze(-1)  # [B, max_i]
+
+    # For sample b, only steps 0..i_vec[b]-1 contribute to the sum
+    selected = torch.where(valid, selected, torch.zeros_like(selected))
+    log_q_total = selected.sum(dim=1) / i_vec  # [B]
+
     return log_q_total
 
 
-# def train_step_rloo(model, x_target, device, seq_len):
-#     """
-#     RLOO training step with SAME number of unmasked positions across batch.
-#     """
-#     B, L = x_target.shape
-#     mask_id = model.mask_id
-#     q_logits = model.get_variational_logits(x_target)  # [B, L]
-#      # Step 1: Sample ONE random step i for entire batch
-#      #i = random.randint(1, L - 1)  # Single integer, not per-sample!
-#     i_vec = torch.randint(1, L, (B,), device=x_target.device)
-#     with torch.no_grad():
-#          # q_logits = model.get_variational_logits(x_target)  # [B, L]
+
+def train_step_rloo_var(model, x_target, device, seq_len):
+    """
+    RLOO training step with SAME number of unmasked positions across batch.
+    """
+    B, L = x_target.shape
+    mask_id = model.mask_id
+    q_logits = model.get_variational_logits(x_target)  # [B, L]
+     # Step 1: Sample ONE random step i for entire batch
+     #i = random.randint(1, L - 1)  # Single integer, not per-sample!
+    i_vec = torch.randint(1, L, (B,), device=x_target.device)
+    with torch.no_grad():
+         # q_logits = model.get_variational_logits(x_target)  # [B, L]
         
-#          # Each sample gets its own ordering
-#         z1_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
-#         z2_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
+         # Each sample gets its own ordering
+        z1_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
+        z2_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
+        z3_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
+        z4_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
 
-#      #z1_prefix = z1_full[:, :x]  # [B, x] - all samples have x unmasked (x is different for each)
-#      #z2_prefix = z2_full[:, :x]  # [B, x] - all samples have x unmasked (x is different for each) 
-#      #x_masked_1, mask_1 = create_masked_input(x_target, z1_prefix, x, mask_id)
-#      #x_masked_2, mask_2 = create_masked_input(x_target, z2_prefix, x, mask_id)
-#     x_masked_1, mask_1 = create_masked_input_varlen(x_target, z1_full, i_vec, mask_id)
-#     x_masked_2, mask_2 = create_masked_input_varlen(x_target, z2_full, i_vec, mask_id)
+     #z1_prefix = z1_full[:, :x]  # [B, x] - all samples have x unmasked (x is different for each)
+     #z2_prefix = z2_full[:, :x]  # [B, x] - all samples have x unmasked (x is different for each) 
+     #x_masked_1, mask_1 = create_masked_input(x_target, z1_prefix, x, mask_id)
+     #x_masked_2, mask_2 = create_masked_input(x_target, z2_prefix, x, mask_id)
+    x_masked_1, mask_1 = create_masked_input_varlen(x_target, z1_full, i_vec, mask_id)
+    x_masked_2, mask_2 = create_masked_input_varlen(x_target, z2_full, i_vec, mask_id)
+    x_masked_3, mask_3 = create_masked_input_varlen(x_target, z3_full, i_vec, mask_id)
+    x_masked_4, mask_4 = create_masked_input_varlen(x_target, z4_full, i_vec, mask_id)
 
-#     q_logits_det   = q_logits.detach()
-#     F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, q_logits=q_logits_det)
-#     F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, q_logits=q_logits_det)
-#      #F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, z1_prefix, device, q_logits=q_logits_det)
-#      #F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, z2_prefix, device, q_logits=q_logits_det)
+    q_logits_det   = q_logits.detach()
+    F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, q_logits=q_logits_det)
+    F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, q_logits=q_logits_det)
+    F3 = compute_F_theta(model, x_masked_3, x_target, mask_3, q_logits=q_logits_det)
+    F4 = compute_F_theta(model, x_masked_4, x_target, mask_4, q_logits=q_logits_det)
+    F1 = (F1 + F3) / 2.0
+    F2 = (F2 + F4) / 2.0
+     #F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, z1_prefix, device, q_logits=q_logits_det)
+     #F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, z2_prefix, device, q_logits=q_logits_det)
 
-#      #log_q1 = compute_log_q_ordering(model, x_target, z1_prefix, q_logits=q_logits)
-#      #log_q2 = compute_log_q_ordering(model, x_target, z2_prefix, q_logits=q_logits)
-#     log_q1 = compute_log_q_prefix_varlen(q_logits, z1_full, i_vec)     # grads to q
-#     log_q2 = compute_log_q_prefix_varlen(q_logits, z2_full, i_vec)
+     #log_q1 = compute_log_q_ordering(model, x_target, z1_prefix, q_logits=q_logits)
+     #log_q2 = compute_log_q_ordering(model, x_target, z2_prefix, q_logits=q_logits)
+    log_q1 = compute_log_q_prefix_varlen(q_logits, z1_full, i_vec)     # grads to q
+    log_q2 = compute_log_q_prefix_varlen(q_logits, z2_full, i_vec)
+    log_q3 = compute_log_q_prefix_varlen(q_logits, z3_full, i_vec)
+    log_q4 = compute_log_q_prefix_varlen(q_logits, z4_full, i_vec)
+    log_q1 = (log_q1 + log_q3) / 2.0
+    log_q2 = (log_q2 + log_q4) / 2.0
 
-#     Delta_F = F1 - F2
-#      #delta_F = Delta_F - Delta_F.mean()               # center over batch
-#      #Delta_F = torch.clamp(delta_F, -1.0, 1.0)
-#     loss = - torch.mean(
-#         (log_q1 - log_q2) * Delta_F.detach() + F1 + F2
-#     )
+    Delta_F = F1 - F2
+     #delta_F = Delta_F - Delta_F.mean()               # center over batch
+     #Delta_F = torch.clamp(delta_F, -1.0, 1.0)
+    loss = - torch.mean(
+        (log_q1 - log_q2) * Delta_F.detach() + (F1 + F2)
+    )
+    with torch.no_grad():
+        q_probs = F.softmax(q_logits, dim=-1)
+        q_entropy = -(q_probs * F.log_softmax(q_logits, dim=-1)).sum(dim=-1).mean()
 
-#     return {
-#          "loss": loss,                        # The actual training loss
-#          "F1": F1.mean().detach(),           # F_theta for ordering 1
-#          "F2": F2.mean().detach(),           # F_theta for ordering 2
-#          "log_q1": log_q1.mean().detach(),   # Log prob of ordering 1
-#          "log_q2": log_q2.mean().detach(),   # Log prob of ordering 2
-#          "Delta_F": Delta_F.mean().detach(), # Difference (for RLOO baseline)
-#          "Delta_F_std": Delta_F.std().item(),
-#          "num_unmasked": int(round(i_vec.float().mean().item()))
-#     }
+    # Encourage exploration early, reduce later
+    entropy_bonus = 0.01 * q_entropy
+    loss = loss - entropy_bonus  # Subtract because we're minimizing
+
+    return {
+         "loss": loss,                        # The actual training loss
+         "F1": F1.mean().detach(),           # F_theta for ordering 1
+         "F2": F2.mean().detach(),           # F_theta for ordering 2
+         "log_q1": log_q1.mean().detach(),   # Log prob of ordering 1
+         "log_q2": log_q2.mean().detach(),   # Log prob of ordering 2
+         "Delta_F": Delta_F.mean().detach(), # Difference (for RLOO baseline)
+         "Delta_F_std": Delta_F.std().item(),
+         "num_unmasked": int(round(i_vec.float().mean().item())),
+         "entropy": q_entropy.item()
+    }
 
 def train_step_rloo(model, x_target, device, seq_len):
-   """
-   RLOO training step with SAME number of unmasked positions across batch.
-   """
-   B, L = x_target.shape
-   mask_id = model.mask_id
-   q_logits = model.get_variational_logits(x_target)  # [B, L]
-   
-   # CHANGE: Single i for entire batch
-   i = random.randint(1, L - 1)  # Single integer
-   
-   with torch.no_grad():
-       z1_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
-       z2_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
-   
-   # CHANGE: Extract same prefix length for all samples
-   z1_prefix = z1_full[:, :i]  # [B, i]
-   z2_prefix = z2_full[:, :i]  # [B, i]
-   
-   # CHANGE: Use simpler create_masked_input with scalar i
-   x_masked_1, mask_1 = create_masked_input(x_target, z1_prefix, i, mask_id)
-   x_masked_2, mask_2 = create_masked_input(x_target, z2_prefix, i, mask_id)
+    """
+    RLOO training step with SAME number of unmasked positions across batch.
+    """
+    B, L = x_target.shape
+    mask_id = model.mask_id
+    q_logits = model.get_variational_logits(x_target)  # [B, L]
+    
+    # CHANGE: Single i for entire batch
+    i = random.randint(1, L - 1)  # Single integer
+    
+    with torch.no_grad():
+        z1_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
+        z2_full = model.sample_ordering_gumbel(q_logits)  # [B, L]
+    
+    # CHANGE: Extract same prefix length for all samples
+    z1_prefix = z1_full[:, :i]  # [B, i]
+    z2_prefix = z2_full[:, :i]  # [B, i]
+    
+    # CHANGE: Use simpler create_masked_input with scalar i
+    x_masked_1, mask_1 = create_masked_input(x_target, z1_prefix, i, mask_id)
+    x_masked_2, mask_2 = create_masked_input(x_target, z2_prefix, i, mask_id)
 
-   q_logits_det = q_logits.detach()
-   F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, q_logits=q_logits_det)
-   F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, q_logits=q_logits_det)
+    q_logits_det = q_logits.detach()
+    F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, q_logits=q_logits_det)
+    F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, q_logits=q_logits_det)
 
-   # CHANGE: Use simpler compute_log_q_ordering
-   log_q1 = compute_log_q_ordering(model, x_target, z1_prefix, q_logits=q_logits)
-   log_q2 = compute_log_q_ordering(model, x_target, z2_prefix, q_logits=q_logits)
+    # CHANGE: Use simpler compute_log_q_ordering
+    log_q1 = compute_log_q_ordering(model, x_target, z1_prefix, q_logits=q_logits)
+    log_q2 = compute_log_q_ordering(model, x_target, z2_prefix, q_logits=q_logits)
 
-   Delta_F = F1 - F2
-   loss = - torch.mean(
-       ((log_q1 - log_q2) / i) * Delta_F.detach() + F1 + F2
-   )
+    Delta_F = F1 - F2
+    loss = - torch.mean(
+        ((log_q1 - log_q2)) * Delta_F.detach() + F1 + F2
+    )
 
-   return {
-       "loss": loss,
-       "F1": F1.mean().detach(),
-       "F2": F2.mean().detach(),
-       "log_q1": log_q1.mean().detach(),
-       "log_q2": log_q2.mean().detach(),
-       "Delta_F": Delta_F.mean().detach(),
-       "Delta_F_std": Delta_F.std().item(),
-       "num_unmasked": i  # CHANGE: Just return scalar i
-   }
-# def train_step_rloo_logger(model, x_target, device, seq_len, debug_step=None):
-#     """
-#     RLOO with full debugging output.
-#     """
-#     B, L = x_target.shape
-#     mask_id = model.mask_id
+    return {
+        "loss": loss,
+        "F1": F1.mean().detach(),
+        "F2": F2.mean().detach(),
+        "log_q1": log_q1.mean().detach(),
+        "log_q2": log_q2.mean().detach(),
+        "Delta_F": Delta_F.mean().detach(),
+        "Delta_F_std": Delta_F.std().item(),
+        "num_unmasked": i  # CHANGE: Just return scalar i
+    }
+def train_step_rloo_logger(model, x_target, device, seq_len, debug_step=None):
+    """
+    RLOO with full debugging output.
+    """
+    B, L = x_target.shape
+    mask_id = model.mask_id
 
-#     # Get variational policy logits
-#     q_logits = model.get_variational_logits(x_target)  # [B, L]
+    # Get variational policy logits
+    q_logits = model.get_variational_logits(x_target)  # [B, L]
 
-#     # Sample same i for entire batch
-#     i = random.randint(1, L - 1)
+    # Sample same i for entire batch
+    i = random.randint(1, L - 1)
 
-#     # Sample two orderings
-#     with torch.no_grad():
-#         z1_full = model.sample_ordering_gumbel(q_logits)
-#         z2_full = model.sample_ordering_gumbel(q_logits)
+    # Sample two orderings
+    with torch.no_grad():
+        z1_full = model.sample_ordering_gumbel(q_logits)
+        z2_full = model.sample_ordering_gumbel(q_logits)
 
-#     z1_prefix = z1_full[:, :i]
-#     z2_prefix = z2_full[:, :i]
+    z1_prefix = z1_full[:, :i]
+    z2_prefix = z2_full[:, :i]
 
-#     # Create masked inputs
-#     x_masked_1, mask_1 = create_masked_input(x_target, z1_prefix, i, mask_id)
-#     x_masked_2, mask_2 = create_masked_input(x_target, z2_prefix, i, mask_id)
+    # Create masked inputs
+    x_masked_1, mask_1 = create_masked_input(x_target, z1_prefix, i, mask_id)
+    x_masked_2, mask_2 = create_masked_input(x_target, z2_prefix, i, mask_id)
 
-#     # Compute F values
-#     q_logits_det = q_logits.detach()
-#     F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, q_logits=q_logits_det)
-#     F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, q_logits=q_logits_det)
+    # Compute F values
+    q_logits_det = q_logits.detach()
+    F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, q_logits=q_logits_det)
+    F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, q_logits=q_logits_det)
 
-#     # Compute log probabilities
-#     log_q1 = compute_log_q_ordering(model, x_target, z1_prefix, q_logits=q_logits)
-#     log_q2 = compute_log_q_ordering(model, x_target, z2_prefix, q_logits=q_logits)
+    # Compute log probabilities
+    log_q1 = compute_log_q_ordering(model, x_target, z1_prefix, q_logits=q_logits)
+    log_q2 = compute_log_q_ordering(model, x_target, z2_prefix, q_logits=q_logits)
 
-#     Delta_F = F1 - F2
+    Delta_F = F1 - F2
 
-#     # Loss with proper normalization
-#     loss = -  torch.mean(
-#         ((log_q1 - log_q2)) * Delta_F.detach() + F1 + F2
-#     )
+    # Loss with proper normalization
+    loss = -  torch.mean(
+        ((log_q1 - log_q2)) * Delta_F.detach() + F1 + F2
+    )
 
-#     # ============================================================
-#     # DEBUGGING OUTPUT
-#     # ============================================================
-#     if debug_step is not None and (debug_step % 50 == 0):
-#         with torch.no_grad():
-#             # Check ordering diversity
-#             same_first = (z1_full[:, 0] == z2_full[:, 0]).float().mean().item()
+    # ============================================================
+    # DEBUGGING OUTPUT
+    # ============================================================
+    if debug_step is not None and (debug_step % 50 == 0):
+        with torch.no_grad():
+            # Check ordering diversity
+            same_first = (z1_full[:, 0] == z2_full[:, 0]).float().mean().item()
 
-#             # Check prefix overlap
-#             overlap_count = 0
-#             for b in range(min(B, 4)):
-#                 z1_set = set(z1_prefix[b].cpu().tolist())
-#                 z2_set = set(z2_prefix[b].cpu().tolist())
-#                 overlap_count += len(z1_set & z2_set)
-#             avg_overlap = overlap_count / min(B, 4) / i
+            # Check prefix overlap
+            overlap_count = 0
+            for b in range(min(B, 4)):
+                z1_set = set(z1_prefix[b].cpu().tolist())
+                z2_set = set(z2_prefix[b].cpu().tolist())
+                overlap_count += len(z1_set & z2_set)
+            avg_overlap = overlap_count / min(B, 4) / i
 
-#             # Check q_logits statistics
-#             q_probs = F.softmax(q_logits, dim=-1)
-#             q_entropy = -(q_probs * F.log_softmax(q_logits, dim=-1)).sum(dim=-1).mean().item()
-#             q_max_prob = q_probs.max(dim=-1)[0].mean().item()
+            # Check q_logits statistics
+            q_probs = F.softmax(q_logits, dim=-1)
+            q_entropy = -(q_probs * F.log_softmax(q_logits, dim=-1)).sum(dim=-1).mean().item()
+            q_max_prob = q_probs.max(dim=-1)[0].mean().item()
 
-#             # Check F values distribution
-#             f1_mean = F1.mean().item()
-#             f1_std = F1.std().item()
-#             f2_mean = F2.mean().item()
-#             f2_std = F2.std().item()
-#             delta_f_mean = Delta_F.mean().item()
-#             delta_f_std = Delta_F.std().item()
+            # Check F values distribution
+            f1_mean = F1.mean().item()
+            f1_std = F1.std().item()
+            f2_mean = F2.mean().item()
+            f2_std = F2.std().item()
+            delta_f_mean = Delta_F.mean().item()
+            delta_f_std = Delta_F.std().item()
 
-#             # Check log_q values
-#             log_q1_mean = log_q1.mean().item()
-#             log_q2_mean = log_q2.mean().item()
-#             log_q_per_step_1 = log_q1_mean / i
-#             log_q_per_step_2 = log_q2_mean / i
+            # Check log_q values
+            log_q1_mean = log_q1.mean().item()
+            log_q2_mean = log_q2.mean().item()
+            log_q_per_step_1 = log_q1_mean / i
+            log_q_per_step_2 = log_q2_mean / i
 
-#             # Check model policy at first masked position
-#             h1 = model.encode(x_masked_1, use_mask=False)
-#             p_logits_1 = model.order_head(h1).squeeze(-1)
-#             p_logits_masked_1 = p_logits_1.masked_fill(~mask_1, float('-inf'))
-#             p_probs_1 = F.softmax(p_logits_masked_1, dim=-1)
-#             # Better:
-#             valid_mask = (p_probs_1 > 0)
-#             p_logprobs = F.log_softmax(p_logits_masked_1, dim=-1)
-#             p_entropy_1 = -(p_probs_1[valid_mask] * p_logprobs[valid_mask]).sum() / valid_mask.sum()
-#             #p_entropy_1 = -(p_probs_1 * F.log_softmax(p_logits_masked_1, dim=-1)).sum(dim=-1).mean().item()
+            # Check model policy at first masked position
+            #h1 = model.encode(x_masked_1, use_mask=False)
+            h1 = model.encode(x_masked_1, use_mask = True)
+            p_logits_1 = model.order_head(h1).squeeze(-1)
+            p_logits_masked_1 = p_logits_1.masked_fill(~mask_1, float('-inf'))
+            p_probs_1 = F.softmax(p_logits_masked_1, dim=-1)
+            # Better:
+            valid_mask = (p_probs_1 > 0)
+            p_logprobs = F.log_softmax(p_logits_masked_1, dim=-1)
+            p_entropy_1 = -(p_probs_1[valid_mask] * p_logprobs[valid_mask]).sum() / valid_mask.sum()
+            #p_entropy_1 = -(p_probs_1 * F.log_softmax(p_logits_masked_1, dim=-1)).sum(dim=-1).mean().item()
 
-#             print(f"\n{'='*70}")
-#             print(f"DEBUG @ Step {debug_step}")
-#             print(f"{'='*70}")
-#             print(f"Sequence info:")
-#             print(f"  i (num unmasked): {i}")
-#             print(f"  L (seq length): {L}")
-#             print(f"  Masked positions: {mask_1.sum().item() / B:.1f} avg per sample")
+            print(f"\n{'='*70}")
+            print(f"DEBUG @ Step {debug_step}")
+            print(f"{'='*70}")
+            print(f"Sequence info:")
+            print(f"  i (num unmasked): {i}")
+            print(f"  L (seq length): {L}")
+            print(f"  Masked positions: {mask_1.sum().item() / B:.1f} avg per sample")
 
-#             print(f"\nOrdering diversity:")
-#             print(f"  Same first position: {same_first:.3f} (should be < 0.5)")
-#             print(f"  Avg prefix overlap: {avg_overlap:.3f} (should be < 0.5)")
-#             print(f"  z1[0,:5]: {z1_prefix[0, :5].tolist()}")
-#             print(f"  z2[0,:5]: {z2_prefix[0, :5].tolist()}")
+            print(f"\nOrdering diversity:")
+            print(f"  Same first position: {same_first:.3f} (should be < 0.5)")
+            print(f"  Avg prefix overlap: {avg_overlap:.3f} (should be < 0.5)")
+            print(f"  z1[0,:5]: {z1_prefix[0, :5].tolist()}")
+            print(f"  z2[0,:5]: {z2_prefix[0, :5].tolist()}")
 
-#             print(f"\nVariational policy (q):")
-#             print(f"  Entropy: {q_entropy:.2f} / {math.log(L):.2f} (max)")
-#             print(f"  Max prob: {q_max_prob:.4f} (uniform would be {1/L:.4f})")
-#             print(f"  Top-5 probs: {q_probs[0].topk(5)[0].tolist()}")
+            print(f"\nVariational policy (q):")
+            print(f"  Entropy: {q_entropy:.2f} / {math.log(L):.2f} (max)")
+            print(f"  Max prob: {q_max_prob:.4f} (uniform would be {1/L:.4f})")
+            print(f"  Top-5 probs: {q_probs[0].topk(5)[0].tolist()}")
 
-#             print(f"\nModel policy (p) at first sample:")
-#             print(f"  Entropy: {p_entropy_1:.2f} / {math.log(mask_1[0].sum().item()):.2f} (max)")
+            print(f"\nModel policy (p) at first sample:")
+            print(f"  Entropy: {p_entropy_1:.2f} / {math.log(mask_1[0].sum().item()):.2f} (max)")
 
-#             print(f"\nF values:")
-#             print(f"  F1: {f1_mean:.4f} ± {f1_std:.4f}")
-#             print(f"  F2: {f2_mean:.4f} ± {f2_std:.4f}")
-#             print(f"  Delta_F: {delta_f_mean:.4f} ± {delta_f_std:.4f}")
-#             print(f"  |Delta_F| / |F1|: {abs(delta_f_mean) / (abs(f1_mean) + 1e-6):.4f}")
+            print(f"\nF values:")
+            print(f"  F1: {f1_mean:.4f} ± {f1_std:.4f}")
+            print(f"  F2: {f2_mean:.4f} ± {f2_std:.4f}")
+            print(f"  Delta_F: {delta_f_mean:.4f} ± {delta_f_std:.4f}")
+            print(f"  |Delta_F| / |F1|: {abs(delta_f_mean) / (abs(f1_mean) + 1e-6):.4f}")
 
-#             print(f"\nLog probabilities:")
-#             print(f"  log_q1: {log_q1_mean:.2f} (per step: {log_q_per_step_1:.4f})")
-#             print(f"  log_q2: {log_q2_mean:.2f} (per step: {log_q_per_step_2:.4f})")
-#             print(f"  Prob per step: {math.exp(log_q_per_step_1):.4f}, {math.exp(log_q_per_step_2):.4f}")
+            print(f"\nLog probabilities:")
+            print(f"  log_q1: {log_q1_mean:.2f} (per step: {log_q_per_step_1:.4f})")
+            print(f"  log_q2: {log_q2_mean:.2f} (per step: {log_q_per_step_2:.4f})")
+            print(f"  Prob per step: {math.exp(log_q_per_step_1):.4f}, {math.exp(log_q_per_step_2):.4f}")
 
-#             print(f"\nLoss components:")
-#             reinforce_term = ((log_q1 - log_q2) / L * Delta_F.detach()).mean().item()
-#             pathwise_term = (F1 + F2).mean().item()
-#             print(f"  REINFORCE term: {reinforce_term:.4f}")
-#             print(f"  Pathwise term: {pathwise_term:.4f}")
-#             print(f"  Total loss: {loss.item():.4f}")
+            print(f"\nLoss components:")
+            reinforce_term = ((log_q1 - log_q2) / L * Delta_F.detach()).mean().item()
+            pathwise_term = (F1 + F2).mean().item()
+            print(f"  REINFORCE term: {reinforce_term:.4f}")
+            print(f"  Pathwise term: {pathwise_term:.4f}")
+            print(f"  Total loss: {loss.item():.4f}")
 
-#             print(f"{'='*70}\n")
+            print(f"{'='*70}\n")
 
-#     return {
-#         "loss": loss,
-#         "F1": F1.mean().detach(),
-#         "F2": F2.mean().detach(),
-#         "log_q1": log_q1.mean().detach(),
-#         "log_q2": log_q2.mean().detach(),
-#         "Delta_F": Delta_F.mean().detach(),
-#         "Delta_F_std": Delta_F.std().item(),
-#         "num_unmasked": i
-#     }
+    return {
+        "loss": loss,
+        "F1": F1.mean().detach(),
+        "F2": F2.mean().detach(),
+        "log_q1": log_q1.mean().detach(),
+        "log_q2": log_q2.mean().detach(),
+        "Delta_F": Delta_F.mean().detach(),
+        "Delta_F_std": Delta_F.std().item(),
+        "num_unmasked": i
+    }
 
 
 # In your training loop, pass the step number:
@@ -751,11 +818,11 @@ def main(config):
         variational_policy=config.get("variational_policy", "shared_torso")
     ).to(device)
     #model.load_state_dict(torch.load("./pretrained.pth"))
-    state_dict = torch.load("./pretrained.pth", map_location=device)
-    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
-        state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+    #state_dict = torch.load("./pretrained.pth", map_location=device)
+    #if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+    #    state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
 
-    model.load_state_dict(state_dict, strict=True)
+    #model.load_state_dict(state_dict, strict=True)
 
 
     model.eos_id = eos_id
@@ -763,7 +830,22 @@ def main(config):
     model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr = config["lr"], betas=(0.9, 0.95), weight_decay=1e-3, fused=True)
+    def get_lr_lambda(step):
+        warmup_steps = config["warmup_steps"]
+        max_steps = config["max_steps"]
+        min_lr_ratio = config["min_lr_ratio"]
+
+        if step < warmup_steps:
+            # Linear warmup from 0 to 1
+            return step / warmup_steps
+        else:
+            # Cosine decay from 1 to min_lr_ratio
+            progress = (step - warmup_steps) / (max_steps - warmup_steps)
+            return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=get_lr_lambda)
     scaler = torch.cuda.amp.GradScaler(enabled=(device=="cuda"))
+    #scheduler = lr_scheduler.CosineAnnealingLR(optimizer,) 
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -779,6 +861,8 @@ def main(config):
         "log_q1": 0.0,
         "log_q2": 0.0,
         "Delta_F": 0.0,
+        "grad_norm":0.0,
+        "entropy": 0.0,
         }
         step_counts = torch.zeros(config["block_size"], dtype=torch.long)
         t0 = time.time()
@@ -787,16 +871,18 @@ def main(config):
             x_target = batch["x_target"].to(device)
 
             with torch.cuda.amp.autocast(enabled = (device=="cuda")):
-                out = train_step_rloo(
+                out = train_step_rloo_var(
                 model, x_target, device, config["block_size"]
             )
             loss = out["loss"]
 
             scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
 
             running["loss"] += loss.item()
             running["F1"] += out["F1"].item()
@@ -804,6 +890,8 @@ def main(config):
             running["log_q1"] += out["log_q1"].item()
             running["log_q2"] += out["log_q2"].item()
             running["Delta_F"] += out["Delta_F"].item()
+            running["grad_norm"] += grad_norm
+            running["entropy"] += out["entropy"]
             step_counts[out["num_unmasked"] - 1] += 1
 
             if it % 50000 == 0:
@@ -822,6 +910,8 @@ def main(config):
                     "train/log_q1": running["log_q1"],
                     "train/log_q2": running["log_q2"],
                     "train/Delta_F": running["Delta_F"],
+                    "train/grad_norm": running["grad_norm"],
+                    "train/entropy": running["entropy"],
                     "train/step": global_step
                 })
                 k = out["Delta_F_std"]
@@ -830,7 +920,7 @@ def main(config):
                     f"log_q1={running['log_q1']:.4f}, Delta_F={running['Delta_F']:.4f}, Delta_F_std: {k}")
                 if (it % 500) == 0:
                     print("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%")
-                    samples, orderings = generate_samples(model, tokenizer, device)
+                    samples, orderings = generate_samples(model, tokenizer, device,seq_len = config["block_size"], sample = next(iter(val_loader)))
                     for i in range(len(samples)):
                         print(samples[i])
                     print("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%")
@@ -872,11 +962,11 @@ if __name__ == "__main__":
     CONFIG = {
         "wandb_project": "order-ar-openwebtext",
         "model_name": "gpt2",
-        "block_size": 64,           # try 1024 if you have VRAM
+        "block_size": 512,           # try 1024 if you have VRAM
         "batch_size": 32,
         "eval_batch_size": 2,
         "epochs": 3,
-        "lr": 1e-5,
+        "lr": 1e-4,
         "mask_prob": [1, 0.15,0.15,0.15, 0.2, 0.5, 0.15, 0.15, 0.7, 0.9, 1],
         "seed": 42,
         "eval_stride": 32,
@@ -888,7 +978,13 @@ if __name__ == "__main__":
         "n_heads": 8,
         "num_ar_steps": 10,        # number of autoregressive unmasking steps per training iteration
         "cache_dir": "./data_cache",
-        "variational_policy": "shared_torso"  # or "separate_heads"
+        "warmup_steps": 1000,
+        "min_lr_ratio": 0.01,
+        "max_steps": 75000,
+        "variational_policy": "shared_torso",  # or "separate_heads"
+        "entropy_coef_start": 0.02,  # High exploration early
+        "entropy_coef_end": 0.001,    # Low exploration late
+        "entropy_anneal_steps": 50000
     }
     # Example: quick overrides
     # CONFIG.update({"batch_size": 16, "lr": 2e-4})
