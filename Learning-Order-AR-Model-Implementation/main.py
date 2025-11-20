@@ -41,7 +41,7 @@ def load_openwebtext(block_size=1024):
     ds = load_dataset("openwebtext", cache_dir = "/scratch/gilbreth/rai53/hf_cache")["train"].train_test_split(test_size=0.005, seed = 42)
     return {"train": ds["train"], "validation": ds["test"]}
 
-def tokenize_and_chunk(ds, tokenizer, block_size=1024, cache_dir="./data_cache"):
+def tokenize_and_chunk(ds, tokenizer, block_size=1024, cache_dir="./data_cache_64"):
     """
     Tokenize and chunk dataset with caching support
     
@@ -496,7 +496,7 @@ def compute_log_q_prefix_varlen(q_logits, z_full, i_vec):
 
     # For sample b, only steps 0..i_vec[b]-1 contribute to the sum
     selected = torch.where(valid, selected, torch.zeros_like(selected))
-    log_q_total = selected.sum(dim=1) / i_vec  # [B]
+    log_q_total = selected.sum(dim=1)  # [B]
 
     return log_q_total
 
@@ -552,7 +552,7 @@ def train_step_rloo_var(model, x_target, device, seq_len):
     Delta_F = F1 - F2
      #delta_F = Delta_F - Delta_F.mean()               # center over batch
      #Delta_F = torch.clamp(delta_F, -1.0, 1.0)
-    loss = - torch.mean(
+    loss = - L/2 * torch.mean(
         (log_q1 - log_q2) * Delta_F.detach() + (F1 + F2)
     )
     with torch.no_grad():
@@ -574,6 +574,122 @@ def train_step_rloo_var(model, x_target, device, seq_len):
          "num_unmasked": int(round(i_vec.float().mean().item())),
          "entropy": q_entropy.item()
     }
+
+def gumbel_softmax_sample(logits, temperature=1.0, hard=False):
+    """
+    Gumbel-Softmax sampling - differentiable!
+    Returns soft sample (hard=False) or hard sample with straight-through (hard=True)
+    """
+    gumbel = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
+    y_soft = F.softmax((logits + gumbel) / temperature, dim=-1)
+    
+    if hard:
+        # Straight-through estimator
+        index = y_soft.argmax(dim=-1, keepdim=True)
+        y_hard = torch.zeros_like(y_soft).scatter_(-1, index, 1.0)
+        # This is the key: use hard for forward, soft for backward
+        y = (y_hard - y_soft).detach() + y_soft
+        return y
+    else:
+        return y_soft
+
+def sample_ordering_differentiable(q_logits, temperature=1.0):
+    """
+    Sample ordering using Gumbel-Softmax with straight-through.
+    Returns hard discrete ordering but with gradients flowing through.
+    """
+    B, L = q_logits.shape
+    ordering = []
+    remaining_mask = torch.ones(B, L, dtype=torch.bool, device=q_logits.device)
+    
+    for i in range(L):
+        # Mask already chosen positions
+        masked_logits = q_logits.clone()
+        masked_logits[~remaining_mask] = float('-inf')
+        
+        # Gumbel-softmax sample (hard mode with straight-through)
+        probs = gumbel_softmax_sample(masked_logits, temperature, hard=True)  # [B, L]
+        
+        # Get the selected index
+        pos = probs.argmax(dim=-1)  # [B]
+        ordering.append(pos)
+        
+        # Update mask
+        remaining_mask[torch.arange(B), pos] = False
+    
+    return torch.stack(ordering, dim=1)  # [B, L]
+
+def train_step_teacher_forcing(model, x_target, device, num_steps=None):
+    """
+    Teacher forcing training with differentiable ordering.
+    Gradients flow through q_θ via the sampled ordering!
+    """
+    B, L = x_target.shape
+    if num_steps is None:
+        num_steps = L - 1
+    
+    # Get variational policy logits (requires gradients!)
+    q_logits = model.get_variational_logits(x_target)  # [B, L]
+    
+    # Sample ordering using Gumbel straight-through
+    # This is differentiable! Gradients flow back to q_logits
+    temperature = 1.0  # Can anneal this during training
+    z_full = sample_ordering_differentiable(q_logits, temperature)  # [B, L]
+    
+    total_token_loss = 0
+    total_order_loss = 0
+    
+    # Sample random steps to train on (or use all)
+    steps = torch.randint(1, L, (num_steps,), device=device)
+    
+    for step_idx in steps:
+        i = step_idx.item()
+        
+        # Create masked input: first i positions in ordering are unmasked
+        z_prefix = z_full[:, :i]
+        x_masked, mask = create_masked_input(x_target, z_prefix, i, model.mask_id)
+        
+        # Encode (gradients flow here)
+        h = model.encode(x_masked, use_mask=True)
+        
+        # Token prediction
+        token_logits = model.token_head(h)  # [B, L, vocab_size]
+        
+        # Order prediction (for regularization)
+        order_logits = model.order_head(h).squeeze(-1)  # [B, L]
+        
+        # Get the next position in the ordering
+        next_pos = z_full[:, i]  # [B]
+        
+        # TOKEN LOSS: Predict the token at next_pos
+        selected_token_logits = token_logits[torch.arange(B), next_pos]
+        selected_targets = x_target[torch.arange(B), next_pos]
+        token_loss = F.cross_entropy(selected_token_logits, selected_targets)
+        
+        # ORDER LOSS: Model's p_θ should match the sampled ordering
+        # Encourage p_θ(order) to be high for the next position
+        order_logits_masked = order_logits.masked_fill(~mask, float('-inf'))
+        order_loss = F.cross_entropy(
+            order_logits_masked, 
+            next_pos,
+            reduction='mean'
+        )
+        
+        total_token_loss += token_loss
+        total_order_loss += order_loss
+    
+    avg_token_loss = total_token_loss / len(steps)
+    avg_order_loss = total_order_loss / len(steps)
+    
+    # Combined loss (both flow gradients to q_θ!)
+    total_loss = avg_token_loss + model.order_weight * avg_order_loss
+    
+    return {
+        "loss": total_loss,
+        "token_loss": avg_token_loss.detach(),
+        "order_loss": avg_order_loss.detach(),
+    }
+
 
 def train_step_rloo(model, x_target, device, seq_len):
     """
@@ -598,7 +714,7 @@ def train_step_rloo(model, x_target, device, seq_len):
     x_masked_1, mask_1 = create_masked_input(x_target, z1_prefix, i, mask_id)
     x_masked_2, mask_2 = create_masked_input(x_target, z2_prefix, i, mask_id)
 
-    q_logits_det = q_logits.detach()
+    q_logits_det = q_logits
     F1 = compute_F_theta(model, x_masked_1, x_target, mask_1, q_logits=q_logits_det)
     F2 = compute_F_theta(model, x_masked_2, x_target, mask_2, q_logits=q_logits_det)
 
@@ -871,7 +987,7 @@ def main(config):
             x_target = batch["x_target"].to(device)
 
             with torch.cuda.amp.autocast(enabled = (device=="cuda")):
-                out = train_step_rloo_var(
+                out = train_step_teacher_forcing(
                 model, x_target, device, config["block_size"]
             )
             loss = out["loss"]
@@ -885,14 +1001,14 @@ def main(config):
             scheduler.step()
 
             running["loss"] += loss.item()
-            running["F1"] += out["F1"].item()
-            running["F2"] += out["F2"].item()
-            running["log_q1"] += out["log_q1"].item()
-            running["log_q2"] += out["log_q2"].item()
-            running["Delta_F"] += out["Delta_F"].item()
+            #running["F1"] += out["F1"].item()
+            #running["F2"] += out["F2"].item()
+            #running["log_q1"] += out["log_q1"].item()
+            #running["log_q2"] += out["log_q2"].item()
+            #running["Delta_F"] += out["Delta_F"].item()
             running["grad_norm"] += grad_norm
-            running["entropy"] += out["entropy"]
-            step_counts[out["num_unmasked"] - 1] += 1
+            #running["entropy"] += out["entropy"]
+            #step_counts[out["num_unmasked"] - 1] += 1
 
             if it % 50000 == 0:
                 save_path = "/scratch/gilbreth/rai53/diffusion/Diffusion/Learning-Order-AR-Model-Implementation/models/train_latest.pth"
@@ -914,7 +1030,8 @@ def main(config):
                     "train/entropy": running["entropy"],
                     "train/step": global_step
                 })
-                k = out["Delta_F_std"]
+                #k = out["Delta_F_std"]
+                k = 0
                 print(f"Step {global_step}: loss={running['loss']:.4f}, "
                     f"F1={running['F1']:.4f}, F2={running['F2']:.4f}, "
                     f"log_q1={running['log_q1']:.4f}, Delta_F={running['Delta_F']:.4f}, Delta_F_std: {k}")
@@ -932,19 +1049,7 @@ def main(config):
 
             global_step += 1
 
-        # val_nll_masked, val_ppl_masked = eval_masked_nll(model, val_loader, device)
-
-        # wandb.log({
-        #     "val/token_nll_masked": val_nll_masked,
-        #     "val/masked_ppl": val_ppl_masked,
-        #     "epoch": epoch
-        # })
-
-
-        # print(f"Epoch {epoch} done in {time.time()-t0:.1f}s | "
-        #       f"val masked NLL: {val_nll_masked:.3f} (PPL {val_ppl_masked:.2f}) | ")
-
-        step_probs = step_counts.float() / step_counts.sum()
+        #step_probs = step_counts.float() / step_counts.sum()
         print(f"Step sampling distribution (should be ~uniform):")
         print(f"  Min: {step_probs.min().item():.4f}, Max: {step_probs.max().item():.4f}, "
             f"Mean: {step_probs.mean().item():.4f}")
@@ -962,7 +1067,7 @@ if __name__ == "__main__":
     CONFIG = {
         "wandb_project": "order-ar-openwebtext",
         "model_name": "gpt2",
-        "block_size": 512,           # try 1024 if you have VRAM
+        "block_size": 64,           # try 1024 if you have VRAM
         "batch_size": 32,
         "eval_batch_size": 2,
         "epochs": 3,
@@ -977,7 +1082,7 @@ if __name__ == "__main__":
         "n_layers": 6,
         "n_heads": 8,
         "num_ar_steps": 10,        # number of autoregressive unmasking steps per training iteration
-        "cache_dir": "./data_cache",
+        "cache_dir": "./data_cache_64",
         "warmup_steps": 1000,
         "min_lr_ratio": 0.01,
         "max_steps": 75000,
