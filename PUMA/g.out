@@ -1,0 +1,98 @@
+Running on: x3107c0s19b1n0
+
+Lmod is automatically replacing "nvidia/25.5" with "gcc-native/14".
+
+
+Lmod is automatically replacing "PrgEnv-nvidia/8.6.0" with "PrgEnv-gnu/8.6.0".
+
+
+Due to MODULEPATH changes, the following have been reloaded:
+  1) cray-mpich/9.0.1
+
+Python being used:
+/home/aakarsh/.conda/envs/trlx-stable/bin/python
+Hey, we start training!
+Training with 1 GPUs
+Checkpoints will be saved to: ckpts/date=2026-02-22-06-02
+Model is ready, parameters: 125.40M
+EMA is enabled with decay: 0.9999
+Using K Schedule:
+Step 30000: K=12
+Step 60000: K=15
+Step 90000: K=18
+Step 120000: K=21
+Step 150000: K=24
+Step 180000: K=27
+Step 210000: K=30
+Step 240000: K=33
+Step 270000: K=36
+Step 300000: K=39
+Step 330000: K=42
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/aakarsh/.netrc.
+wandb: Currently logged in as: aakarshnrai to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run f1g9bt3t
+wandb: Tracking run with wandb version 0.24.2
+wandb: Run data is saved locally in /lus/eagle/projects/lighthouse-purdue/rai53/PUMA/wandb/run-20260222_060301-f1g9bt3t
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run puma
+wandb: ⭐️ View project at https://wandb.ai/aakarshnrai-purdue-university/mdm-pretraining
+wandb: 🚀 View run at https://wandb.ai/aakarshnrai-purdue-university/mdm-pretraining/runs/f1g9bt3t
+Epoch 1:   0%|          | 0/362787 [00:00<?, ?it/s]Epoch 1:   0%|          | 0/362787 [00:00<?, ?it/s]
+Traceback (most recent call last):
+  File "/lus/eagle/projects/lighthouse-purdue/rai53/PUMA/train.py", line 494, in <module>
+    main(cfg)
+  File "/lus/eagle/projects/lighthouse-purdue/rai53/PUMA/train.py", line 400, in main
+    loss.backward()
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/_tensor.py", line 581, in backward
+    torch.autograd.backward(
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/autograd/__init__.py", line 347, in backward
+    _engine_run_backward(
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/autograd/graph.py", line 825, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 9.26 GiB. GPU 0 has a total capacity of 39.49 GiB of which 8.22 GiB is free. Including non-PyTorch memory, this process has 31.27 GiB memory in use. Of the allocated memory 30.76 GiB is allocated by PyTorch, and 7.95 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/lus/eagle/projects/lighthouse-purdue/rai53/PUMA/train.py", line 494, in <module>
+[rank0]:     main(cfg)
+[rank0]:   File "/lus/eagle/projects/lighthouse-purdue/rai53/PUMA/train.py", line 400, in main
+[rank0]:     loss.backward()
+[rank0]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/_tensor.py", line 581, in backward
+[rank0]:     torch.autograd.backward(
+[rank0]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/autograd/__init__.py", line 347, in backward
+[rank0]:     _engine_run_backward(
+[rank0]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/autograd/graph.py", line 825, in _engine_run_backward
+[rank0]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank0]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 9.26 GiB. GPU 0 has a total capacity of 39.49 GiB of which 8.22 GiB is free. Including non-PyTorch memory, this process has 31.27 GiB memory in use. Of the allocated memory 30.76 GiB is allocated by PyTorch, and 7.95 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mpuma[0m at: [34mhttps://wandb.ai/aakarshnrai-purdue-university/mdm-pretraining/runs/f1g9bt3t[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/run-20260222_060301-f1g9bt3t/logs[0m
+[rank0]:[W222 06:03:09.740099654 ProcessGroupNCCL.cpp:1250] Warning: WARNING: process group has NOT been destroyed before we destruct ProcessGroupNCCL. On normal program exit, the application should call destroy_process_group to ensure that any pending NCCL operations have finished in this process. In rare cases this process can exit before this point and block the progress of another member of the process group. This constraint has always been present,  but this warning has only been added since PyTorch 2.4 (function operator())
+E0222 06:03:11.508000 3180851 site-packages/torch/distributed/elastic/multiprocessing/api.py:869] failed (exitcode: 1) local_rank: 0 (pid: 3180983) of binary: /home/aakarsh/.conda/envs/trlx-stable/bin/python3.10
+Traceback (most recent call last):
+  File "/home/aakarsh/.conda/envs/trlx-stable/bin/torchrun", line 7, in <module>
+    sys.exit(main())
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 355, in wrapper
+    return f(*args, **kwargs)
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/distributed/run.py", line 919, in main
+    run(args)
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/distributed/run.py", line 910, in run
+    elastic_launch(
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 138, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 269, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+train.py FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-02-22_06:03:11
+  host      : x3107c0s19b1n0.hsn.cm.polaris.alcf.anl.gov
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 3180983)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="120" viewBox="0 0 1900 120" role="img" aria-label="PUMA: Progressive Unmasking for Accelerated Masked Diffusion Training">
+  <rect width="100%" height="100%" fill="white"/>
+  <text x="20" y="78" font-family="Arial, Helvetica, sans-serif" font-size="50" font-weight="700" fill="#111111">
+    <tspan fill="#3A86FF">P</tspan><tspan fill="#3A86FF">U</tspan><tspan fill="#3A86FF">M</tspan><tspan fill="#3A86FF">A</tspan><tspan fill="#111111">: </tspan>
+    <tspan fill="#3A86FF">P</tspan><tspan fill="#111111">rogressive </tspan>
+    <tspan fill="#3A86FF">U</tspan><tspan fill="#111111">n</tspan><tspan fill="#3A86FF">M</tspan><tspan fill="#3A86FF">A</tspan><tspan fill="#111111">sking for Accelerated Masked Diffusion Training</tspan>
+  </text>
+</svg>

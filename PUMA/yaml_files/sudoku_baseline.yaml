@@ -1,0 +1,51 @@
+model:
+  vocab_size: 11
+  hidden_size: 256
+  intermediate_size: 768
+  num_layers: 8
+  num_attention_heads: 8
+  num_kv_heads: 8
+  max_position: 162
+  rms_norm_eps: 1e-6
+  dropout: 0.0
+
+training:
+  strategy: "standard"
+  data_ratio: 1.0
+  learning_rate: 3e-4
+  weight_decay: 0.01
+  num_epochs: 2
+  max_grad_norm: 1.0
+  batch_size: 32
+  warmup_steps: 1000
+  logging_steps: 100
+  eval_steps: 2000
+  save_steps: 10000
+  ema: null
+  eos_id: null
+
+validation:
+  val_dir: "data/sudoku_new"
+  ratio: 0.01
+  sampling: 
+    temperature: 0.0
+    confidence: ["top_k", "top_k_margin"]
+    unmasking_num: [1, 2, 3]
+
+data:
+  mask_id: 10
+  dataset: "sudoku"
+  data_dir: "data/sudoku_new"
+  sudoku_type: "new"
+  val_ratio: 0.05
+  seed: 2026
+  mmap: false
+  training:
+    per_gpu_batch_size: ${training.batch_size}
+    cpus: 4
+
+wandb:
+  wandb: true
+  project: "mdm-pretraining"
+  name: "sudoku-baseline"
+  entity: "your-entity-here"

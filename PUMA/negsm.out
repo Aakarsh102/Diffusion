@@ -1,0 +1,130 @@
+Running on: x3001c0s13b1n0
+
+Lmod is automatically replacing "nvidia/25.5" with "gcc-native/14".
+
+
+Lmod is automatically replacing "PrgEnv-nvidia/8.6.0" with "PrgEnv-gnu/8.6.0".
+
+
+Due to MODULEPATH changes, the following have been reloaded:
+  1) cray-mpich/9.0.1
+
+Python being used:
+/home/aakarsh/.conda/envs/trlx-stable/bin/python
+/lus/eagle/projects/lighthouse-purdue/rai53/PUMA/see.py:62: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  ckpt = torch.load(ckpt_path, map_location=device)
+Traceback (most recent call last):
+  File "/lus/eagle/projects/lighthouse-purdue/rai53/PUMA/see.py", line 156, in <module>
+    main()
+  File "/lus/eagle/projects/lighthouse-purdue/rai53/PUMA/see.py", line 126, in main
+    model = load_model(args.dataset, args.ckpt, device)
+  File "/lus/eagle/projects/lighthouse-purdue/rai53/PUMA/see.py", line 62, in load_model
+    ckpt = torch.load(ckpt_path, map_location=device)
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/serialization.py", line 1319, in load
+    with _open_file_like(f, "rb") as opened_file:
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/serialization.py", line 659, in _open_file_like
+    return _open_file(name_or_buffer, mode)
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/serialization.py", line 640, in __init__
+    super().__init__(open(name, mode))
+FileNotFoundError: [Errno 2] No such file or directory: '/lus/eagle/projects/lighthouse-purdue/rai53/PUMA/ckpts/date=2026-02-24-12-30/step=50000'
+Running on: x3001c0s13b1n0
+
+Lmod is automatically replacing "nvidia/25.5" with "gcc-native/14".
+
+
+Lmod is automatically replacing "PrgEnv-nvidia/8.6.0" with "PrgEnv-gnu/8.6.0".
+
+
+Due to MODULEPATH changes, the following have been reloaded:
+  1) cray-mpich/9.0.1
+
+Python being used:
+/home/aakarsh/.conda/envs/trlx-stable/bin/python
+/lus/eagle/projects/lighthouse-purdue/rai53/PUMA/see.py:62: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  ckpt = torch.load(ckpt_path, map_location=device)
+Loaded checkpoint: /lus/eagle/projects/lighthouse-purdue/rai53/PUMA/ckpts/date=2026-02-24-12-30/step=50000.pt
+Model: 125.4M params on cuda
+
+Generating 6 samples  |  3072 total masks to fill
+  confidence=top_k  |S|=2  temp=0.0
+
+Done. Remaining masks: 0
+
+==================================================
+  Sample 1
+==================================================
+  tokens (first 60): [151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643] ...
+
+==================================================
+  Sample 2
+==================================================
+  tokens (first 60): [151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643] ...
+
+==================================================
+  Sample 3
+==================================================
+  tokens (first 60): [151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643] ...
+
+==================================================
+  Sample 4
+==================================================
+  tokens (first 60): [151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643] ...
+
+==================================================
+  Sample 5
+==================================================
+  tokens (first 60): [151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643] ...
+
+==================================================
+  Sample 6
+==================================================
+  tokens (first 60): [151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643, 151643] ...
+
+Running on: x3001c0s19b1n0
+
+Lmod is automatically replacing "nvidia/25.5" with "gcc-native/14".
+
+
+Lmod is automatically replacing "PrgEnv-nvidia/8.6.0" with "PrgEnv-gnu/8.6.0".
+
+
+Due to MODULEPATH changes, the following have been reloaded:
+  1) cray-mpich/9.0.1
+
+Python being used:
+/home/aakarsh/.conda/envs/trlx-stable/bin/python
+/lus/eagle/projects/lighthouse-purdue/rai53/PUMA/debug_mdm_checkpoint.py:30: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  ckpt = torch.load(CKPT_PATH, map_location="cpu")
+
+Loading checkpoint...
+Checkpoint vocab_size: 151645
+Checkpoint hidden_size: 512
+
+Building tiny test model just to inspect weights...
+
+==== LOAD STATE DICT ====
+Missing keys: []
+Unexpected keys: ['layers.2.attn_norm.weight', 'layers.2.attn.q_proj.weight', 'layers.2.attn.q_proj.bias', 'layers.2.attn.k_proj.weight', 'layers.2.attn.k_proj.bias', 'layers.2.attn.v_proj.weight', 'layers.2.attn.v_proj.bias', 'layers.2.attn.o_proj.weight', 'layers.2.attn.o_proj.bias', 'layers.2.mlp_norm.weight', 'layers.2.mlp.w1.weight', 'layers.2.mlp.w2.weight', 'layers.2.mlp.w3.weight', 'layers.3.attn_norm.weight', 'layers.3.attn.q_proj.weight', 'layers.3.attn.q_proj.bias', 'layers.3.attn.k_proj.weight', 'layers.3.attn.k_proj.bias', 'layers.3.attn.v_proj.weight', 'layers.3.attn.v_proj.bias']
+
+Loading tokenizer...
+
+==== VOCAB CHECK ====
+Tokenizer vocab_size: 151643
+Checkpoint vocab_size: 151645
+
+==== SPECIAL TOKENS ====
+mask_token_id: None
+pad_token_id : 151643
+unk_token_id : None
+eos_token_id : 151643
+
+==== TROUBLE TOKEN ====
+151643 -> <|endoftext|>
+
+==== LOGIT CHECK ====
+Top-10 token ids: [14906, 121, 24044, 12405, 37641, 149859, 131787, 84599, 36396, 9278]
+Top-10 probs: [0.6377274394035339, 0.29049643874168396, 0.037714239209890366, 0.006658990401774645, 0.004324468318372965, 0.003888149978592992, 0.0034676240757107735, 0.0019455949077382684, 0.0016947656404227018, 0.0015255602775141597]
+Entropy: 0.9856616854667664
+
+Done.
+
