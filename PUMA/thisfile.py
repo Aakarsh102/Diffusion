@@ -1,5 +1,4 @@
 import math, os, time, json, random, sys, datetime
-from torch.cuda.nvtx import range as nv_range
 import numpy as np
 import torch
 import torch.nn as nn
@@ -102,52 +101,6 @@ def mdm_loss(model, input_ids, mask_id: int, prompt_mask: Optional[torch.Tensor]
         ce = F.cross_entropy(logits[mask_indices], input_ids[mask_indices], reduction="none")
     loss = ce / num_mask[mask_indices]
     return loss.sum() / B
-
-def log_linear_alpha(t: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
-    """α(t) = exp(-t · log(1/ε)),  so α(0)=1, α(1)≈ε."""
-    return torch.exp(-t * math.log(1.0 / eps))
-
-def mdm_loss_loglinear(model, input_ids, mask_id: int, prompt_mask: Optional[torch.Tensor] = None, arm_init: bool = False, eps = 1e-3):
-    if prompt_mask is None:
-        prompt_mask = torch.zeros_like(input_ids, dtype = torch.bool)
-    device = input_ids.device
-    B, L = input_ids.shape
-
-    t = torch.rand(B, device = device) * (1 - eps) + eps 
-    alpha_t = log_linear_alpha(t)
-    mask_prob = ( 1 - alpha_t)
-
-    rand = torch.rand(B, L, device = device)
-    mask_indices = (rand < mask_prob.unsqueeze(1)) & ~prompt_mask
-
-    no_mask = ~mask_indices.any(dim=1)
-    if no_mask.any():
-        # force-mask one random non-prompt position
-        force = torch.rand(B, L, device=device).masked_fill(prompt_mask, 2.0)
-        pos = force.argmin(dim=1)                                 # (B,)
-        mask_indices[no_mask, pos[no_mask]] = True
-    masked_input = torch.where(mask_indices, mask_id, input_ids)
-
-    logits = model(masked_input)
-    nll = F.cross_entropy(
-        logits.view(-1, logits.size(-1)),
-        input_ids.view(-1),
-        reduction="none",
-    ).view(B, L)
-
-    if arm_init: 
-        pass
-    else:
-        nll_masked = (nll * mask_indices).sum(dim = 1)
-        n_masked = mask_indices.sum(dim=1).clamp_min(1).float()
-    # R(t) = β · α(t) / (1 - α(t)),  where β = log(1/ε)
-    beta = math.log(1.0 / eps)
-    weight = beta * alpha_t / (1.0 - alpha_t)                     # (B,)
- 
-    # per-sequence: weight(t) * mean-NLL-over-masked  (mean keeps magnitude stable)
-    per_seq = weight * (nll_masked / n_masked)
-    return per_seq.mean()
-    
 
 def arm_loss(
     model,
@@ -281,7 +234,7 @@ def main(cfg: DictConfig):
     torch.cuda.manual_seed(seed)
 
     # ckpt dir
-    ckpt_dir = f"ckptsprof/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
+    ckpt_dir = f"ckptspumasjsj/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
     os.makedirs(ckpt_dir, exist_ok=True)
     if is_main:
         print(f"Checkpoints will be saved to: {ckpt_dir}")
@@ -444,43 +397,38 @@ def main(cfg: DictConfig):
                 next_k_idx += 1
 
             # to enable flashattention, we do the autocast
-            with torch.autograd.profiler.emit_nvtx():
-                with maybe_no_sync():
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled = torch.cuda.is_available()):
-                        if strategy == "progressive":
-                            xt = pool.current_batch()
-                            with nv_range("forward"):
-                                logits = model(xt)
-                            log_probs = F.log_softmax(logits, dim=-1)
-                            loss = mdm_loss_fn(log_probs, pool.x0, pool.xt, mask_id, prompt_mask = pool.state['prompt_mask'], arm_init=model_config.predict_next_token)
-                        elif strategy == "standard":
-                            batch = itr
-                            input_ids = batch["labels"].to(device)
-                            prompt_mask = batch["prompt_mask"].to(device) if "prompt_mask" in batch else None
-                            # loss = mdm_loss(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
-                            loss = mdm_loss_loglinear(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
-                        elif strategy == "arm":
-                            batch = itr
-                            input_ids = batch["labels"].to(device)
-                            prompt_mask = batch["prompt_mask"].to(device) if "prompt_mask" in batch else None
-                            loss = arm_loss(model, input_ids, eos_id=eos_id, prompt_mask=prompt_mask)
-                        else:
-                            raise ValueError(f"Invalid training strategy: {strategy}")
+            with maybe_no_sync():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled = torch.cuda.is_available()):
+                    if strategy == "progressive":
+                        xt = pool.current_batch()
+                        logits = model(xt)
+                        log_probs = F.log_softmax(logits, dim=-1)
+                        loss = mdm_loss_fn(log_probs, pool.x0, pool.xt, mask_id, prompt_mask = pool.state['prompt_mask'], arm_init=model_config.predict_next_token)
+                    elif strategy == "standard":
+                        batch = itr
+                        input_ids = batch["labels"].to(device)
+                        prompt_mask = batch["prompt_mask"].to(device) if "prompt_mask" in batch else None
+                        loss = mdm_loss(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
+                    elif strategy == "arm":
+                        batch = itr
+                        input_ids = batch["labels"].to(device)
+                        prompt_mask = batch["prompt_mask"].to(device) if "prompt_mask" in batch else None
+                        loss = arm_loss(model, input_ids, eos_id=eos_id, prompt_mask=prompt_mask)
+                    else:
+                        raise ValueError(f"Invalid training strategy: {strategy}")
 
-                    scaled_loss = loss / accum_steps
-                    with nv_range("backward"):
-                        scaled_loss.backward()
+                scaled_loss = loss / accum_steps
+                scaled_loss.backward()
             accum_loss += loss.item()
 
             # update pool every micro-step (chain advances regardless of accumulation)
             if strategy == "progressive":
-                #max_lp = log_probs.max(dim=2)[0]  # [B, L] — only keep what pool needs
-                #del logits, log_probs
-                #pool.update_with_logits(max_lp)
+                # max_lp = log_probs.max(dim=2)[0]  # [B, L] — only keep what pool needs
+                # del logits, log_probs
+                # pool.update_with_logits(max_lp)
                 #pool.update_with_logits(log_probs.detach())
                 #del logits, log_probs
-                with nv_range("update with logits"):
-                    pool.update_with_logits(log_probs)
+                pool.update_with_logits(log_probs)
 
             global_step += 1
             micro_step += 1

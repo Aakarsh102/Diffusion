@@ -11,6 +11,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 
@@ -149,6 +150,35 @@ class TransformerBlock(nn.Module):
 # -------------------------------------------------------
 # Full model
 # -------------------------------------------------------
+class MDMTransformerold(nn.Module):
+    def __init__(self, config: MDMConfig):
+        super().__init__()
+        self.config = config
+        self.emb = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([
+            TransformerBlock(config) for _ in range(config.num_layers)
+        ])
+        self.final_norm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias = False)
+        if config.tie_lm_head:
+            self.lm_head.weight = self.emb.weight
+
+    def forward(self, input_ids: torch.Tensor, logit_mask: torch.Tensor = None):
+        # token embeddings
+        x = self.emb(input_ids)
+
+        # forward pass
+        for layer in self.layers:
+            if self.training:
+                x = checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
+
+        # final layer
+        x = self.final_norm(x)
+        if logit_mask is not None:
+            return self.lm_head(x[logit_mask])  # (N_selected, V)
+        return self.lm_head(x)  # (B, L, V)
 class MDMTransformer(nn.Module):
     def __init__(self, config: MDMConfig):
         super().__init__()
@@ -163,15 +193,23 @@ class MDMTransformer(nn.Module):
             self.lm_head.weight = self.emb.weight
 
     def forward(self, input_ids: torch.Tensor):
-        B, L = input_ids.shape
-        device = input_ids.device
+        #for layer in self.layers:
+        #    x = checkpoint(layer, x, use_reentrant=False)
+
+        #B, L = input_ids.shape
+        #device = input_ids.device
 
         # token embeddings
         x = self.emb(input_ids)
 
         # forward pass
         for layer in self.layers:
-            x = layer(x)
+            if self.training:
+                x = checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
+        #for layer in self.layers:
+        #    x = layer(x)
 
         # final layer
         x = self.final_norm(x)

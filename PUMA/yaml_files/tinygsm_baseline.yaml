@@ -20,7 +20,8 @@ training:
   weight_decay: 0.01
   num_epochs: 20
   max_grad_norm: 1.0
-  batch_size: 32
+  batch_size: 16
+  grad_accum_steps: 4
   warmup_steps: 1000
   logging_steps: 100
   eval_steps: 5000

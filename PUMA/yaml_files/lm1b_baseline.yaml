@@ -1,0 +1,44 @@
+model:
+  vocab_size: 32001       # placeholder — set to sp_vocab_size+1 by train_lm1b.py
+  hidden_size: 768
+  intermediate_size: 2048
+  num_layers: 12
+  num_attention_heads: 12
+  num_kv_heads: 12
+  max_position: 256       # placeholder — set from meta.json
+  rms_norm_eps: 1e-6
+  dropout: 0.0
+  tie_lm_head: true
+  causal: false
+  arm_init: "none"
+
+training:
+  strategy: "standard"
+  eos_id: null
+  learning_rate: 3e-4
+  weight_decay: 0.01
+  num_epochs: 10
+  max_grad_norm: 1.0
+  batch_size: 64
+  grad_accum_steps: 4
+  warmup_steps: 2000
+  logging_steps: 100
+  eval_steps: 5000
+  save_steps: 10000
+  ema: 0.9999
+
+validation:
+  sampling:
+    temperature: 0.0
+    confidence: "top_k"
+    unmasking_num: 4
+
+data:
+  val_ratio: 0.005
+  seed: 2026
+
+wandb:
+  wandb: false
+  project: "puma-lm1b"
+  name: "lm1b-baseline"
+  entity: "your-entity-here"
