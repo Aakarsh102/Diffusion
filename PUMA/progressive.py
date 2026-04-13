@@ -282,6 +282,15 @@ class PhasedMasking:
         self.xt = xt
         self.state['phase'] = phase_next
 
+        #############################################################
+
+        # Also replace immediately if the sequence has completely unmasked (no mask tokens left)
+        # Otherwise, fully unmasked sequences sit in the pool generating exactly 0.0 gradient!
+        is_fully_unmasked = (xt == self.mask_id).sum(dim=1) == 0
+        replace = replace | is_fully_unmasked
+        #############################################################
+
+
         
         # if a seq goes through all stages, we refill
         n_new = int(replace.sum().item())
@@ -296,3 +305,64 @@ class PhasedMasking:
             self.state['phase'][idx] = 0
 
         self.state['t'] += 1 # update the time step
+
+    @torch.no_grad()
+    def update_with_upm_scores(self, upm_scores: torch.Tensor, log_probs: torch.Tensor):
+        """
+        Same logic as update_with_logits, but uses UPM scores for top-K selection.
+        log_probs is still used for confidence thresholding (collapse mode).
+        
+        upm_scores: (B, L) raw UPM ranking scores
+        log_probs:  (B, L, V) base model log-probabilities (for confidence threshold)
+        """
+        B, L, V = log_probs.shape
+        device = self.device
+
+        phase_next = (self.state['phase'] + 1) % self.K
+        replace = (phase_next == 0)
+
+        mask_idx = (self.xt == self.mask_id)
+        assert not (mask_idx & self.state['prompt_mask']).any()
+
+        ratio = self._sample_ratio(phase_next)
+        num_unmask = self._sample_target_unmasked(ratio, self.state['L_eff'])
+        current_num_unmask = (~mask_idx & ~self.state['prompt_mask']).sum(dim=1).long()
+        to_reveal = (num_unmask - current_num_unmask).clamp_min(0)
+        to_reveal = torch.where(replace, torch.zeros_like(to_reveal), to_reveal)
+
+        # ---- the only change: use UPM scores instead of log_probs.max ----
+        k_max = int(to_reveal.max().item())
+        xt = self.xt
+        if k_max > 0:
+            score = torch.where(
+                mask_idx,
+                upm_scores,
+                torch.full_like(upm_scores, torch.finfo(upm_scores.dtype).min)
+            )
+            xt = unmask_from_scores(score, to_reveal, self.x0, self.xt)
+        # ------------------------------------------------------------------
+
+        # confidence thresholding still uses base model probs
+        if self.mode == "confidence_collapse":
+            tau = math.log(self.confidence_threshold)
+            p = log_probs.max(dim=2)[0]
+            update_unmask = (p > tau) & (xt == self.mask_id) & (~self.state['prompt_mask'])
+            xt = torch.where(update_unmask, self.x0, xt)
+            phase_next = self.calculate_phase(xt)
+
+        self.xt = xt
+        self.state['phase'] = phase_next
+
+        # refill (unchanged)
+        n_new = int(replace.sum().item())
+        if n_new > 0:
+            idx = replace.nonzero(as_tuple=False).squeeze(1)
+            stages = torch.zeros(n_new, device=device, dtype=torch.long)
+            new_x0, new_xt, new_masks, new_L_eff = self._refill_pool(n_new, stages)
+            self.x0[idx] = new_x0
+            self.xt[idx] = new_xt
+            self.state['prompt_mask'][idx] = new_masks
+            self.state['L_eff'][idx] = new_L_eff
+            self.state['phase'][idx] = 0
+
+        self.state['t'] += 1

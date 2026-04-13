@@ -1,0 +1,32 @@
+You are completely right, my apologies! I've now directly inspected the `MDMTransformer` architecture in `model/transformer.py` and `model/utils.py`. I see that you are actually already utilizing **gradient checkpointing** (`from torch.utils.checkpoint import checkpoint`) and PyTorch's **`F.scaled_dot_product_attention` (SDPA)**. 
+
+With knowledge of your exact Transformer code, here are the most effective structural and module-level changes to optimize your PUMA training:
+
+### 1. Enforcing True FlashAttention-2 (Time & Memory)
+While you use `F.scaled_dot_product_attention(..., enable_gqa=(H!=K))`, passing a custom `attn_mask` often forces PyTorch to silently disable Flash Attention and fall back to the much slower, memory-intensive `Math` or `MemoryEfficient` attention. 
+Also, your tensors are transposed to `[B, H, L, Hd]`. True FlashAttention requires memory to be contiguous in `[B, L, H, Hd]` format. 
+**Improvement**: Use `flash_attn_func` from `flash-attn` natively. It's significantly faster than `F.scaled_dot_product_attention` for custom tasks. 
+Alternatively, if you're on PyTorch 2.5+, look into **FlexAttention** (`torch.nn.attention.flex_attention`), which allows compiling custom masks natively into the FlashAttention kernel to save $O(L^2)$ memory reads!
+
+### 2. Fused kernels (RMSNorm and SwiGLU)
+In `model/utils.py`, your `RMSNorm` and `SwiGLU` are pure PyTorch:
+```python
+var = x.pow(2).mean(dim=-1, keepdim=True) + eps
+x = x * torch.rsqrt(var)
+```
+Each intermediate variable (`pow`, `mean`, `x * rsqrt`, etc.) creates a memory read and write in VRAM. This bandwidth bottleneck makes standard layers extremely slow.
+**Improvement**: Replace your manual `RMSNorm` with a fused Triton kernel, like `from apex.normalization import FusedRMSNorm` or xformer's implementation. Similarly, your `SwiGLU` can use `from xformers.ops import SwiGLU`. These fused modules combine all operations into one C++ kernel, heavily boosting iterations-per-second and cutting activation memory completely.
+
+### 3. torch.compile (Free Speedup)
+If you don't want to install Triton/xFormers, PyTorch 2.0+ can fuse those `RMSNorm` and `SwiGLU` operations automatically!
+**Improvement**: In `train.py`, simply add `model = torch.compile(model)` right after initializing your `MDMTransformer` and loading your weights. `torch.compile` analyzes your `SwiGLU` and `RMSNorm` logic and JIT compiles it into a fused kernel just like xFormers does, providing a "free" ~20% speedup.
+
+### 4. DeepSpeed ZeRO-2 / ZeRO-3 or PyTorch FSDP
+In `train.py`, you utilize PyTorch DDP (`DistributedDataParallel`). DDP requires each GPU to hold a full clone of the model weights + momentum + variance.
+**Improvement**: With DeepSpeed ZeRO or PyTorch's Fully Sharded Data Parallel (FSDP), the `MDMTransformer` layers are split across the GPUs. Because you are already using Transformer Blocks, partitioning them using DeepSpeed/FSDP is native and allows you to either dramatically boost the batch size or scale up the model parameters with the freed VRAM.
+
+### 5. 8-bit Optimizer (`bitsandbytes`)
+In `train.py`, you are instantiating `optim.AdamW(model.parameters(), ...)`. `AdamW` maintains momentum states that cost 8 bytes per parameter heavily eating VRAM. 
+**Improvement**: Using `import bitsandbytes as bnb` and changing to `bnb.optim.AdamW8bit` collapses those 8-bytes down to 1-byte, slicing the optimizer memory overhead by nearly 75% without degrading precision.
+
+To start, adding `torch.compile` and switching to an 8-bit Adam optimizer are extremely low-effort yet very impact changes! Let me know if you want me to write the actual code.

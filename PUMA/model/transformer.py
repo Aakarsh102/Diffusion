@@ -192,7 +192,7 @@ class MDMTransformer(nn.Module):
         if config.tie_lm_head:
             self.lm_head.weight = self.emb.weight
 
-    def forward(self, input_ids: torch.Tensor):
+    def forward(self, input_ids: torch.Tensor, return_hidden: bool = False):
         #for layer in self.layers:
         #    x = checkpoint(layer, x, use_reentrant=False)
 
@@ -213,8 +213,11 @@ class MDMTransformer(nn.Module):
 
         # final layer
         x = self.final_norm(x)
-        x = self.lm_head(x)
-        return x
+        hidden = x
+        logits = self.lm_head(x)
+        if return_hidden:
+            return logits, hidden
+        return logits
 
 
 if __name__ == "__main__":

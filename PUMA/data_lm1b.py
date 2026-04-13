@@ -22,67 +22,68 @@ from torch.utils.data import Dataset, DataLoader, random_split
 # Preprocessing: tokenize raw text -> memmap
 # ---------------------------------------------------------------------------
 
-def pretokenize_lm1b(data_dir: str, sp_model_path: str, out_dir: str, max_len: int = 256):
+from transformers import AutoTokenizer
+
+def pretokenize_lm1b(data_dir: str, out_dir: str, max_len: int = 256):
     """
     Tokenize all .txt files under *data_dir* (one sentence per line) using
-    the SentencePiece model at *sp_model_path*.  Each sentence is either
-    truncated or padded to *max_len* tokens.  Results are saved as:
-        out_dir/labels.bin   — uint32 memmap  (N, max_len)
-        out_dir/meta.json    — {n_examples, max_len, vocab_size, sp_model}
+    Qwen/Qwen2-0.5B. Each sentence is truncated or padded to *max_len* tokens.
+    Results are saved as memory mapped uint32 arrays for ultra-fast training.
     """
-    sp = spm.SentencePieceProcessor(model_file=sp_model_path)
-    vocab_size = sp.get_piece_size()
-    eos_id = sp.eos_id()
-    pad_id = eos_id  # pad with EOS
+    print("Loading Qwen tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
+    
+    # Qwen doesn't have a default pad token, usually pad = eos
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    eos_id = tokenizer.eos_token_id
+    vocab_size = tokenizer.vocab_size
 
-    # Collect all text files
-    txt_files = sorted(
-        os.path.join(root, f)
-        for root, _, files in os.walk(data_dir)
-        for f in files if f.endswith(".txt")
-    )
-    if not txt_files:
-        raise FileNotFoundError(f"No .txt files found under {data_dir}")
-
-    # First pass: count lines so we can allocate the memmap
-    total_lines = 0
-    for path in txt_files:
-        with open(path, "r", encoding="utf-8") as fh:
-            for _ in fh:
-                total_lines += 1
-    print(f"Found {total_lines} lines across {len(txt_files)} files")
+    from datasets import load_dataset
+    import glob
+    
+    print(f"Loading LM1B from arrow files in: {data_dir}")
+    arrow_files = sorted(glob.glob(os.path.join(data_dir, "lm1b-train-*.arrow")))
+    if not arrow_files:
+        raise FileNotFoundError(f"Could not find 'lm1b-train-*.arrow' in {data_dir}")
+    
+    # Bypass deprecated builder scripts by loading the arrow tables directly
+    ds = load_dataset("arrow", data_files=arrow_files, split="train")
+    total_lines = len(ds)
+    
+    print(f"Found {total_lines} sentences in HuggingFace cache")
 
     os.makedirs(out_dir, exist_ok=True)
     labels_path = os.path.join(out_dir, "labels.bin")
     labels_mm = np.memmap(labels_path, dtype=np.uint32, mode="w+", shape=(total_lines, max_len))
 
     idx = 0
-    for path in txt_files:
-        with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    # keep blank lines as all-pad
-                    labels_mm[idx] = pad_id
-                    idx += 1
-                    continue
-                ids = sp.encode(line, out_type=int)
-                if len(ids) > max_len:
-                    ids = ids[:max_len]
-                else:
-                    ids = ids + [pad_id] * (max_len - len(ids))
-                labels_mm[idx] = np.array(ids, dtype=np.uint32)
-                idx += 1
-                if idx % 500_000 == 0:
-                    print(f"  tokenized {idx}/{total_lines}")
+    for item in ds:
+        line = item["text"].strip()
+        if not line:
+            labels_mm[idx] = pad_id
+            idx += 1
+            continue
+        
+        # Tokenize
+        ids = tokenizer.encode(line, add_special_tokens=False)
+        
+        if len(ids) > max_len:
+            ids = ids[:max_len]
+        else:
+            ids = ids + [pad_id] * (max_len - len(ids))
+            
+        labels_mm[idx] = np.array(ids, dtype=np.uint32)
+        idx += 1
+        if idx % 500_000 == 0:
+            print(f"  tokenized {idx}/{total_lines}")
     labels_mm.flush()
 
     meta = dict(
         n_examples=int(total_lines),
         max_len=max_len,
         vocab_size=vocab_size,
-        sp_model=os.path.abspath(sp_model_path),
         eos_id=eos_id,
+        tokenizer="Qwen/Qwen2-0.5B"
     )
     with open(os.path.join(out_dir, "meta.json"), "w") as fh:
         json.dump(meta, fh, indent=2)
@@ -115,7 +116,9 @@ class LM1BDataset(Dataset):
 
     def __getitem__(self, idx):
         ids = torch.from_numpy(self.labels[idx].astype(np.int64)).long()
-        prompt_mask = torch.zeros(self.L, dtype=torch.bool)
+        # Mark all padding tokens as `prompt_mask = True` so they are excluded from MDM logic!
+        pad_id = self.meta.get("pad_id", 151643)
+        prompt_mask = (ids == pad_id)
         return {"labels": ids, "prompt_mask": prompt_mask}
 
 
@@ -140,13 +143,12 @@ def setup_lm1b_loaders(data_dir: str, batch_size: int, val_ratio: float = 0.02, 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess LM1B text for PUMA training")
     parser.add_argument("--preprocess", action="store_true", help="Run preprocessing")
-    parser.add_argument("--data_dir", type=str, required=True, help="Directory with .txt files (one sentence per line)")
-    parser.add_argument("--sp_model", type=str, required=True, help="Path to SentencePiece .model file")
+    parser.add_argument("--data_dir", type=str, required=True, help="Directory to HF arrow cache files")
     parser.add_argument("--out_dir", type=str, required=True, help="Output directory for memmap files")
     parser.add_argument("--max_len", type=int, default=256, help="Max sequence length (default 256)")
     args = parser.parse_args()
 
     if args.preprocess:
-        pretokenize_lm1b(args.data_dir, args.sp_model, args.out_dir, args.max_len)
+        pretokenize_lm1b(args.data_dir, args.out_dir, args.max_len)
     else:
         print("Pass --preprocess to tokenize raw text. Otherwise import this module.")

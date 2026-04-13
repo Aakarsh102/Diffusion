@@ -1,5 +1,7 @@
 import math, os, time, json, random, sys, datetime
-from torch.cuda.nvtx import range as nv_range
+from upm import UPM
+from upm import compute_reward_pair, plackett_luce_log_prob, sample_plackett_luce, compute_reward_pair_old
+#from torch.cuda.nvtx import range as nv_range
 import numpy as np
 import torch
 import torch.nn as nn
@@ -25,7 +27,7 @@ from eval.sudoku_eval import evaluate_ddp_sudoku
 from eval.gsm8k_eval import evaluate_ddp_gsm8k
 from sampling import mdm_sampling
 from transformers import AutoTokenizer
-to = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
+#to = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -44,10 +46,10 @@ def setup_ddp():
         rank, world_size, local_rank = 0, 1, 0
     return rank, world_size, local_rank
 
-def evaluate_ddp_dict(model, cfg, device, rank, world_size):
+def evaluate_ddp_dict(model, cfg, device, rank, world_size, upm = None):
     sampling = cfg.validation.sampling
     if cfg.training.strategy == "arm":
-        return {"arm": evaluate_ddp(model, cfg, device, rank, world_size, sampling)}
+        return {"arm": evaluate_ddp(model, cfg, device, rank, world_size, sampling, upm)}
     base_sampling = sampling
     out = {}
 
@@ -56,7 +58,7 @@ def evaluate_ddp_dict(model, cfg, device, rank, world_size):
             sampling = deepcopy(base_sampling)
             sampling.confidence = confidence
             sampling.unmasking_num = unmasking_num
-            out[f"{confidence}_unmasking_{unmasking_num}"] = evaluate_ddp(model, cfg, device, rank, world_size, sampling)
+            out[f"{confidence}_unmasking_{unmasking_num}"] = evaluate_ddp(model, cfg, device, rank, world_size, sampling, upm)
     return out
 
 def grad_norm(parameters):
@@ -66,11 +68,13 @@ def grad_norm(parameters):
             total += p.grad.norm(p=2).item()
     return total ** 0.5
 
-def evaluate_ddp(model, cfg, device, rank: int, world_size: int, sampling):
+def evaluate_ddp(model, cfg, device, rank: int, world_size: int, sampling, upm=None):
     if cfg.data.dataset == "sudoku":
         return evaluate_ddp_sudoku(model, cfg, device, rank, world_size, sampling)
     elif cfg.data.dataset == "tinygsm":
-        return evaluate_ddp_gsm8k(model, cfg, device, rank, world_size, sampling)
+        return evaluate_ddp_gsm8k(model, cfg, device, rank, world_size, sampling, upm)
+    elif cfg.data.dataset == "lm1b":
+        return 0.0
     else:
         raise ValueError(f"Invalid dataset: {cfg.data.dataset}")
 
@@ -186,13 +190,15 @@ def arm_loss(
 # validation loss helper
 def val_loss_ddp(model, val_loader, mask_id: int, device, rank: int, world_size: int, strategy: str, eos_id: int, arm_init: bool = False):
     model.eval()
+    # upm.eval()
     if world_size > 1 and dist.is_initialized() and not isinstance(val_loader.sampler, DistributedSampler):
         sampler = DistributedSampler(val_loader.dataset, num_replicas=world_size, rank=rank, shuffle=False)
         val_loader = DataLoader(
         val_loader.dataset,
         batch_size=val_loader.batch_size or 16,
         sampler=sampler,
-        num_workers=getattr(val_loader, "num_workers", 4),
+        #num_workers=getattr(val_loader, "num_workers", 4),
+        num_workers = 0,
         pin_memory=getattr(val_loader, "pin_memory", False),
         drop_last=False,
         )
@@ -281,7 +287,7 @@ def main(cfg: DictConfig):
     torch.cuda.manual_seed(seed)
 
     # ckpt dir
-    ckpt_dir = f"ckptsprof/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
+    ckpt_dir = f"/home/aakarsh/ckptscompdeb/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
     os.makedirs(ckpt_dir, exist_ok=True)
     if is_main:
         print(f"Checkpoints will be saved to: {ckpt_dir}")
@@ -294,8 +300,27 @@ def main(cfg: DictConfig):
 
     # Initialize the model
     model_cfg_dict = cfg.model
+    
+    if cfg.data.dataset == "lm1b":
+        meta_path = os.path.join(cfg.data.data_dir, "meta.json")
+        with open(meta_path, "r") as fh:
+            _meta = json.load(fh)
+        # Force the model to build with enough tokens to encapsulate BOTH padding token (vocab_size) and mask token (vocab_size + 1)
+        model_cfg_dict.vocab_size = _meta["vocab_size"] + 2
+        model_cfg_dict.max_position = _meta["max_len"]
+
     model_config = MDMConfig(**model_cfg_dict)
     model = MDMTransformer(model_config).to(device)
+    condition_dim = model_config.hidden_size  # must be even; each half = 128
+    upm = UPM(
+        hidden_size=model_config.hidden_size,
+        condition_dim=condition_dim,
+        num_heads=8,
+    ).to(device)
+
+    if is_main:
+        num_params = sum(p.numel() for p in upm.parameters())
+        print(f"UPM parameters: {num_params/1e6:.2f}M")
 
     # ARM initialization
     arm_init_path = model_cfg_dict.get("arm_init", "none")
@@ -315,16 +340,43 @@ def main(cfg: DictConfig):
     # model wrapping
     if world_size > 1 and torch.cuda.is_available():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        upm = DDP(upm, device_ids=[local_rank], output_device=local_rank)
         if is_main:
             print(f"Model wrapping is done!")
+
+    all_params = (
+        list(model.parameters())
+        + list(upm.parameters())
+    )
+    
+
 
     # data
     data_cfg = cfg.data
     train_cfg = cfg.training
     assert train_cfg.save_steps % train_cfg.eval_steps == 0, "save_steps must be divisible by eval_steps"
     val_cfg = cfg.validation
-    data_bundle = setup_data_bundle(data_cfg)
-    train_loader, val_loader = data_bundle.train_loader, data_bundle.val_loader    
+    if data_cfg.dataset == "lm1b":
+        from data_lm1b import setup_lm1b_loaders
+        
+        # Load vocab stats to dynamically set mask_id
+        meta_path = os.path.join(data_cfg.data_dir, "meta.json")
+        with open(meta_path) as fh:
+            meta = json.load(fh)
+        
+        # Guarantee mask_id is isolated from the pad_token_id (which rests precisely at vocab_size in Qwen2).
+        data_cfg.mask_id = meta["vocab_size"] + 1
+        
+        train_loader, val_loader = setup_lm1b_loaders(
+            data_cfg.data_dir,
+            batch_size=train_cfg.batch_size,
+            val_ratio=getattr(data_cfg, "val_ratio", 0.02),
+            seed=getattr(data_cfg, "seed", 2026),
+        )
+    else:
+        # Standard fallback for tinygsm, sudoku, etc.
+        data_bundle = setup_data_bundle(data_cfg)
+        train_loader, val_loader = data_bundle.train_loader, data_bundle.val_loader    
     mask_id = data_cfg.mask_id
     eos_id = getattr(val_cfg.sampling, "eos_id", None)
 
@@ -341,7 +393,8 @@ def main(cfg: DictConfig):
             train_loader.dataset,
             batch_size=train_cfg.batch_size,
             sampler=train_sampler,
-            num_workers=4,
+            # changed this in sohpia
+            num_workers=2,
             pin_memory=False,
             drop_last=False
         )
@@ -349,7 +402,12 @@ def main(cfg: DictConfig):
         train_sampler = None
 
     # optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay)
+    optimizer = optim.AdamW(
+        all_params,
+        lr=train_cfg.learning_rate,
+        weight_decay=train_cfg.weight_decay,
+    )
+    #optimizer = optim.AdamW(model.parameters(), lr=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay)
     num_training_steps = train_cfg.num_epochs * len(train_loader)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=train_cfg.warmup_steps, num_training_steps=num_training_steps)
     if train_cfg.ema is not None:
@@ -401,9 +459,12 @@ def main(cfg: DictConfig):
     # wandb initialize
     if cfg.wandb.wandb and is_main:
         wandb.init(project=cfg.wandb.project, entity = "aakarshnrai-purdue-university",name=cfg.wandb.name)
-    from contextlib import nullcontext
+    from contextlib import nullcontext, ExitStack
     for epoch in range(train_cfg.num_epochs):
         model.train()
+        upm.train()
+        upm_module = upm.module if isinstance(upm, DDP) else upm
+        model_module = model.module if isinstance(model, DDP) else model
 
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -422,14 +483,22 @@ def main(cfg: DictConfig):
 
         optimizer.zero_grad()
         accum_loss = 0.0
+        accum_mdm_loss = 0.0
+        accum_upm_loss = 0.0
+        accum_adv_mag = 0.0
+        accum_r_mag = 0.0
+        accum_lp_diff = 0.0
         micro_step = 0
 
         # helper: skip DDP gradient sync on non-final micro-steps
         use_ddp = isinstance(model, DDP)
         def maybe_no_sync():
+            stack = ExitStack()
             if use_ddp and (micro_step + 1) % accum_steps != 0:
-                return model.no_sync()
-            return nullcontext()
+                stack.enter_context(model.no_sync())
+                if isinstance(upm, DDP):
+                    stack.enter_context(upm.no_sync())
+            return stack
 
         for itr in pbar:
             # update current K if using k schedule (based on optimizer steps, not micro-steps)
@@ -444,50 +513,139 @@ def main(cfg: DictConfig):
                 next_k_idx += 1
 
             # to enable flashattention, we do the autocast
-            with torch.autograd.profiler.emit_nvtx():
-                with maybe_no_sync():
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled = torch.cuda.is_available()):
-                        if strategy == "progressive":
-                            xt = pool.current_batch()
-                            with nv_range("forward"):
-                                logits = model(xt)
-                            log_probs = F.log_softmax(logits, dim=-1)
-                            loss = mdm_loss_fn(log_probs, pool.x0, pool.xt, mask_id, prompt_mask = pool.state['prompt_mask'], arm_init=model_config.predict_next_token)
-                        elif strategy == "standard":
-                            batch = itr
-                            input_ids = batch["labels"].to(device)
-                            prompt_mask = batch["prompt_mask"].to(device) if "prompt_mask" in batch else None
-                            # loss = mdm_loss(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
-                            loss = mdm_loss_loglinear(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
-                        elif strategy == "arm":
-                            batch = itr
-                            input_ids = batch["labels"].to(device)
-                            prompt_mask = batch["prompt_mask"].to(device) if "prompt_mask" in batch else None
-                            loss = arm_loss(model, input_ids, eos_id=eos_id, prompt_mask=prompt_mask)
-                        else:
-                            raise ValueError(f"Invalid training strategy: {strategy}")
+            # with torch.autograd.profiler.emit_nvtx():
+            with maybe_no_sync():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled = torch.cuda.is_available()):
+                    if strategy == "progressive":
+                        xt = pool.current_batch()
+                        # with nv_range("forward"):
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            logits, hidden = model(xt, return_hidden=True)
+                        # logits = model(xt)
+                        
+                        log_probs = F.log_softmax(logits, dim=-1)
+                        mdm_l = mdm_loss_fn(log_probs, pool.x0, pool.xt, mask_id, prompt_mask = pool.state['prompt_mask'], arm_init=model_config.predict_next_token)
+                        mask_idx = xt == mask_id
+                        t_step = pool.state['phase'].float() / pool.K  
+                        #mask_emb = mask_indicator_embedding(mask_idx.long())
+                        upm_scores_raw = upm(hidden.detach(), t_step, mask_idx).float()         # (B, L), finite
+                        # Blend UPM scores with log(max_prob) as confidence proxy.
+                        # UPM learns a *correction* on top of confidence, not a replacement.
+                        # Must match eval-time blending for train/eval consistency.
+                        # log_prob_max = max_logit - logsumexp: exact, no extra (B,L,V) memory.
+                        #log_conf = (logits.max(dim=-1).values - logits.logsumexp(dim=-1)).detach()  # (B, L)
 
-                    scaled_loss = loss / accum_steps
-                    with nv_range("backward"):
-                        scaled_loss.backward()
+
+
+                        log_conf = (logits.max(dim=-1).values - logits.logsumexp(dim=-1)).detach()  # (B, L)
+                        blended_scores = upm_scores_raw + log_conf
+                        #blended = upm_scores_raw
+
+                        # --- THE FIX: Add Temperature Scaling for RL Exploration ---
+                        tau = 2.0  # Adjust this: higher = more exploration, lower = deterministic
+                        blended_scores = blended_scores / tau
+
+                        upm_scores = blended_scores.masked_fill(~mask_idx, float('-inf'))  # for sampling
+                        #blended_scores = upm_scores_raw + log_conf
+                        #upm_scores = blended_scores.masked_fill(~mask_idx, float('-inf'))  # for sampling
+
+
+                        # --- RLOO ---
+                        mean_L_eff = pool.state['L_eff'].float().mean()
+                        k_unmask = max(int(mean_L_eff / pool.K), 1)
+                        #k_unmask = 4
+                        n_masked_per_seq = mask_idx.sum(dim=1)
+                        valid = n_masked_per_seq >= k_unmask
+
+                        if valid.any():
+                            U1, _ = sample_plackett_luce(upm_scores, mask_idx, k_unmask)
+                            U2, _ = sample_plackett_luce(upm_scores, mask_idx, k_unmask)
+                            
+                            safe_indices = torch.arange(xt.shape[1], device=xt.device).unsqueeze(0).expand(xt.shape[0], -1)[:, :k_unmask]
+                            U1 = torch.where(valid.unsqueeze(1), U1, safe_indices)
+                            U2 = torch.where(valid.unsqueeze(1), U2, safe_indices)
+                            
+                            xt_after_1 = xt.clone()
+                            xt_after_2 = xt.clone()
+                            B_actual = xt.shape[0]
+                            batch_indices = torch.arange(B_actual, device=xt.device).unsqueeze(1).expand(-1, k_unmask)
+                            xt_after_1[batch_indices, U1] = pool.x0[batch_indices, U1]
+                            xt_after_2[batch_indices, U2] = pool.x0[batch_indices, U2]
+                            
+                            r1, r2 = compute_reward_pair(
+                                model_module, pool.x0, logits.detach(), xt_after_1, xt_after_2,
+                                mask_id, pool.state['prompt_mask']
+                            )
+
+                            A1 = r1 - r2
+                            A2 = r2 - r1
+                            A1 = torch.where(valid, A1, torch.zeros_like(A1))
+                            A2 = torch.where(valid, A2, torch.zeros_like(A2))
+
+                            lp1 = plackett_luce_log_prob(upm_scores, U1, mask_idx)
+                            lp2 = plackett_luce_log_prob(upm_scores, U2, mask_idx)
+                            # Zero out lp for invalid samples to prevent inf*0=NaN
+                            lp1 = torch.where(valid, lp1, torch.zeros_like(lp1))
+                            lp2 = torch.where(valid, lp2, torch.zeros_like(lp2))
+                            
+                            per_sample = -(A1 * lp1 + A2 * lp2)
+                            per_sample = per_sample * valid.float()
+                            upm_loss = per_sample.sum() / valid.sum().clamp_min(1).float()
+
+                            # diagnostics (detached, for logging only)
+                            _adv_mag = A1[valid].abs().mean().item() if valid.any() else 0.0
+                            _r_mag = ((r1[valid].abs() + r2[valid].abs()) / 2).mean().item() if valid.any() else 0.0
+                            _lp_diff = (lp1[valid] - lp2[valid]).abs().mean().item() if valid.any() else 0.0
+                        else:
+                            # Connect to UPM graph so DDP sees the same params on every rank
+                            upm_loss = upm_scores_raw.sum() * 0.0
+                            _adv_mag = 0.0
+                            _r_mag = 0.0
+                            _lp_diff = 0.0
+
+                        lambda_upm = 1.0
+                        loss = mdm_l + lambda_upm * upm_loss
+
+                    elif strategy == "standard":
+                        batch = itr
+                        input_ids = batch["labels"].to(device)
+                        prompt_mask = batch["prompt_mask"].to(device) if "prompt_mask" in batch else (input_ids == 151643).to(device)
+                        # loss = mdm_loss(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
+                        loss = mdm_loss_loglinear(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
+                    elif strategy == "arm":
+                        batch = itr
+                        input_ids = batch["labels"].to(device)
+                        prompt_mask = batch["prompt_mask"].to(device) if "prompt_mask" in batch else (input_ids == 151643).to(device)
+                        loss = arm_loss(model, input_ids, eos_id=eos_id, prompt_mask=prompt_mask)
+                    else:
+                        raise ValueError(f"Invalid training strategy: {strategy}")
+
+                scaled_loss = loss / accum_steps
+                # with nv_range("backward"):
+                scaled_loss.backward()
             accum_loss += loss.item()
+            if strategy == "progressive":
+                accum_mdm_loss += mdm_l.item()
+                accum_upm_loss += upm_loss.item() if isinstance(upm_loss, torch.Tensor) else upm_loss
+                accum_adv_mag += _adv_mag
+                accum_r_mag += _r_mag
+                accum_lp_diff += _lp_diff
 
             # update pool every micro-step (chain advances regardless of accumulation)
             if strategy == "progressive":
-                #max_lp = log_probs.max(dim=2)[0]  # [B, L] — only keep what pool needs
-                #del logits, log_probs
-                #pool.update_with_logits(max_lp)
-                #pool.update_with_logits(log_probs.detach())
-                #del logits, log_probs
-                with nv_range("update with logits"):
-                    pool.update_with_logits(log_probs)
+                #pool.update_with_logits(log_probs)
+                pool.update_with_upm_scores(upm_scores.detach(), log_probs.detach())
+
 
             global_step += 1
             micro_step += 1
 
             if micro_step % accum_steps == 0:
                 if train_cfg.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(
+                        list(model.parameters()) + list(upm.parameters()),
+                        train_cfg.max_grad_norm
+                    )
                 optimizer.step()
                 
                 if train_cfg.ema is not None:
@@ -495,6 +653,7 @@ def main(cfg: DictConfig):
                 scheduler.step()
 
                 opt_step = global_step // accum_steps
+                should_log = (opt_step % train_cfg.logging_steps == 0)
                 if is_main:
                     avg_loss = accum_loss / accum_steps
                     pbar.set_postfix(loss=avg_loss, lr=optimizer.param_groups[0]["lr"], opt_step=opt_step)
@@ -509,16 +668,37 @@ def main(cfg: DictConfig):
 
                             if strategy == "progressive":
                                 wandb.log({"current_k": current_k}, step=opt_step)
+
+                # DDP-reduced mdm / upm losses (all ranks must participate)
+                if strategy == "progressive" and should_log:
+                    avg_mdm = torch.tensor(accum_mdm_loss / accum_steps, device=device)
+                    avg_upm = torch.tensor(accum_upm_loss / accum_steps, device=device)
+                    dist.all_reduce(avg_mdm, op=dist.ReduceOp.AVG)
+                    dist.all_reduce(avg_upm, op=dist.ReduceOp.AVG)
+                    if is_main and cfg.wandb.wandb:
+                        wandb.log({
+                            "mdm_loss": avg_mdm.item(),
+                            "upm_loss": avg_upm.item(),
+                            "upm/adv_mag": accum_adv_mag / accum_steps,
+                            "upm/reward_mag": accum_r_mag / accum_steps,
+                            "upm/lp_diff": accum_lp_diff / accum_steps,
+                        }, step=opt_step)
                 optimizer.zero_grad()
                 accum_loss = 0.0
+                accum_mdm_loss = 0.0
+                accum_upm_loss = 0.0
+                accum_adv_mag = 0.0
+                accum_r_mag = 0.0
+                accum_lp_diff = 0.0
 
             opt_step = global_step // accum_steps
             if global_step % accum_steps == 0 and opt_step % train_cfg.eval_steps == 0 and opt_step > 0:
                 model.eval()
+                upm.eval()
 
                 # validaton on the downstream task; disabled when we use EMA
                 if train_cfg.ema is None:
-                    val_acc_dict = evaluate_ddp_dict(model, cfg, device, rank, world_size)
+                    val_acc_dict = evaluate_ddp_dict(model_module, cfg, device, rank, world_size, upm=upm_module)
                 else:
                     val_acc_dict = None
 
@@ -534,7 +714,7 @@ def main(cfg: DictConfig):
 
                     with torch.inference_mode():
                         # validaton on the downstream task
-                        val_acc_dict = evaluate_ddp_dict(model, cfg, device, rank, world_size)
+                        val_acc_dict = evaluate_ddp_dict(model_module, cfg, device, rank, world_size, upm=upm_module)
                     ema.restore(model_to_ema.parameters())
 
                 if is_main:
@@ -579,6 +759,7 @@ def main(cfg: DictConfig):
                             #print(f"Model saved to: {saved_path}")
 
                 model.train()
+                upm.train()
     
     if cfg.wandb.wandb and is_main:
         wandb.finish()
