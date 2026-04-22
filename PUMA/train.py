@@ -287,7 +287,7 @@ def main(cfg: DictConfig):
     torch.cuda.manual_seed(seed)
 
     # ckpt dir
-    ckpt_dir = f"/home/aakarsh/ckptscompdeb/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
+    ckpt_dir = f"ckptslm1bNOCONFCOLLAPSEPLAINMDLM/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
     os.makedirs(ckpt_dir, exist_ok=True)
     if is_main:
         print(f"Checkpoints will be saved to: {ckpt_dir}")
@@ -312,6 +312,13 @@ def main(cfg: DictConfig):
     model_config = MDMConfig(**model_cfg_dict)
     model = MDMTransformer(model_config).to(device)
     condition_dim = model_config.hidden_size  # must be even; each half = 128
+#    ckpt = torch.load("~/ckptsPUMATRAININGCOMPLETE1288gpu/date=2026-04-15-23-38/ema_step=370000.pt", map_location=device, weights_only=True)
+    #ckpt = torch.load("/home/aakarsh/ckptsPUMATRAININGCOMPLETE1288gpu/date=2026-04-15-23-38/ema_step=370000.pt", map_location=device, weights_only=True)
+    
+    #sd = ckpt.get("model_state_dict", ckpt)
+    # Strip 'module.' prefix if saved from DDP
+    #sd = {k.replace("module.", ""): v for k, v in sd.items()}
+    #model.load_state_dict(sd, strict=True)
     upm = UPM(
         hidden_size=model_config.hidden_size,
         condition_dim=condition_dim,
@@ -402,9 +409,12 @@ def main(cfg: DictConfig):
         train_sampler = None
 
     # optimizer and scheduler
+    upm_lr = train_cfg.learning_rate / 10;
     optimizer = optim.AdamW(
-        all_params,
-        lr=train_cfg.learning_rate,
+        [
+            {"params": model.parameters(), "lr": train_cfg.learning_rate},
+            {"params": upm.parameters(), "lr": upm_lr}
+        ], 
         weight_decay=train_cfg.weight_decay,
     )
     #optimizer = optim.AdamW(model.parameters(), lr=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay)
@@ -419,6 +429,9 @@ def main(cfg: DictConfig):
             print("EMA is enabled with decay:", train_cfg.ema)
 
     strategy = train_cfg.strategy
+    upm_warmup_steps = getattr(train_cfg, "upm_warmup_steps", 0)
+    if is_main and upm_warmup_steps > 0:
+        print(f"UPM warmup: {upm_warmup_steps} optimizer steps (confidence-based ordering, no RLOO)")
     # k schedule for progressive unmasking. If None use fixed K. If "linear", linearly increase the unmasking steps from 1 to K over the training steps.
     # If a list of integers, use the list as the k_steps. If an integer, use constant interval increase.
     if strategy == "progressive":
@@ -527,77 +540,77 @@ def main(cfg: DictConfig):
                         mdm_l = mdm_loss_fn(log_probs, pool.x0, pool.xt, mask_id, prompt_mask = pool.state['prompt_mask'], arm_init=model_config.predict_next_token)
                         mask_idx = xt == mask_id
                         t_step = pool.state['phase'].float() / pool.K  
-                        #mask_emb = mask_indicator_embedding(mask_idx.long())
-                        upm_scores_raw = upm(hidden.detach(), t_step, mask_idx).float()         # (B, L), finite
-                        # Blend UPM scores with log(max_prob) as confidence proxy.
-                        # UPM learns a *correction* on top of confidence, not a replacement.
-                        # Must match eval-time blending for train/eval consistency.
-                        # log_prob_max = max_logit - logsumexp: exact, no extra (B,L,V) memory.
-                        #log_conf = (logits.max(dim=-1).values - logits.logsumexp(dim=-1)).detach()  # (B, L)
+                        # UPM forward (always runs so DDP sees all params in backward)
+                        upm_scores_raw = upm(hidden.detach(), t_step, mask_idx).float()
 
+                        opt_step_now = global_step // accum_steps
+                        use_upm = opt_step_now >= upm_warmup_steps
 
+                        if use_upm:
+                            log_conf = (logits.max(dim=-1).values - logits.logsumexp(dim=-1)).detach()
+                            blended_scores = upm_scores_raw + log_conf
 
-                        log_conf = (logits.max(dim=-1).values - logits.logsumexp(dim=-1)).detach()  # (B, L)
-                        blended_scores = upm_scores_raw + log_conf
-                        #blended = upm_scores_raw
+                            tau = 2.0
+                            blended_scores = blended_scores / tau
 
-                        # --- THE FIX: Add Temperature Scaling for RL Exploration ---
-                        tau = 2.0  # Adjust this: higher = more exploration, lower = deterministic
-                        blended_scores = blended_scores / tau
+                            upm_scores = blended_scores.masked_fill(~mask_idx, float('-inf'))
 
-                        upm_scores = blended_scores.masked_fill(~mask_idx, float('-inf'))  # for sampling
-                        #blended_scores = upm_scores_raw + log_conf
-                        #upm_scores = blended_scores.masked_fill(~mask_idx, float('-inf'))  # for sampling
+                            # --- RLOO ---
+                            mean_L_eff = pool.state['L_eff'].float().mean()
+                            k_unmask = max(int(mean_L_eff / pool.K), 1)
+                            n_masked_per_seq = mask_idx.sum(dim=1)
+                            valid = n_masked_per_seq >= k_unmask
 
+                            if valid.any():
+                                U1, _ = sample_plackett_luce(upm_scores, mask_idx, k_unmask)
+                                U2, _ = sample_plackett_luce(upm_scores, mask_idx, k_unmask)
 
-                        # --- RLOO ---
-                        mean_L_eff = pool.state['L_eff'].float().mean()
-                        k_unmask = max(int(mean_L_eff / pool.K), 1)
-                        #k_unmask = 4
-                        n_masked_per_seq = mask_idx.sum(dim=1)
-                        valid = n_masked_per_seq >= k_unmask
+                                safe_indices = torch.arange(xt.shape[1], device=xt.device).unsqueeze(0).expand(xt.shape[0], -1)[:, :k_unmask]
+                                U1 = torch.where(valid.unsqueeze(1), U1, safe_indices)
+                                U2 = torch.where(valid.unsqueeze(1), U2, safe_indices)
 
-                        if valid.any():
-                            U1, _ = sample_plackett_luce(upm_scores, mask_idx, k_unmask)
-                            U2, _ = sample_plackett_luce(upm_scores, mask_idx, k_unmask)
-                            
-                            safe_indices = torch.arange(xt.shape[1], device=xt.device).unsqueeze(0).expand(xt.shape[0], -1)[:, :k_unmask]
-                            U1 = torch.where(valid.unsqueeze(1), U1, safe_indices)
-                            U2 = torch.where(valid.unsqueeze(1), U2, safe_indices)
-                            
-                            xt_after_1 = xt.clone()
-                            xt_after_2 = xt.clone()
-                            B_actual = xt.shape[0]
-                            batch_indices = torch.arange(B_actual, device=xt.device).unsqueeze(1).expand(-1, k_unmask)
-                            xt_after_1[batch_indices, U1] = pool.x0[batch_indices, U1]
-                            xt_after_2[batch_indices, U2] = pool.x0[batch_indices, U2]
-                            
-                            r1, r2 = compute_reward_pair(
-                                model_module, pool.x0, logits.detach(), xt_after_1, xt_after_2,
-                                mask_id, pool.state['prompt_mask']
-                            )
+                                xt_after_1 = xt.clone()
+                                xt_after_2 = xt.clone()
+                                B_actual = xt.shape[0]
+                                batch_indices = torch.arange(B_actual, device=xt.device).unsqueeze(1).expand(-1, k_unmask)
+                                xt_after_1[batch_indices, U1] = pool.x0[batch_indices, U1]
+                                xt_after_2[batch_indices, U2] = pool.x0[batch_indices, U2]
 
-                            A1 = r1 - r2
-                            A2 = r2 - r1
-                            A1 = torch.where(valid, A1, torch.zeros_like(A1))
-                            A2 = torch.where(valid, A2, torch.zeros_like(A2))
+                                r1, r2 = compute_reward_pair(
+                                    model_module, pool.x0, logits.detach(), xt_after_1, xt_after_2,
+                                    mask_id, pool.state['prompt_mask']
+                                )
 
-                            lp1 = plackett_luce_log_prob(upm_scores, U1, mask_idx)
-                            lp2 = plackett_luce_log_prob(upm_scores, U2, mask_idx)
-                            # Zero out lp for invalid samples to prevent inf*0=NaN
-                            lp1 = torch.where(valid, lp1, torch.zeros_like(lp1))
-                            lp2 = torch.where(valid, lp2, torch.zeros_like(lp2))
-                            
-                            per_sample = -(A1 * lp1 + A2 * lp2)
-                            per_sample = per_sample * valid.float()
-                            upm_loss = per_sample.sum() / valid.sum().clamp_min(1).float()
+                                A1 = r1 - r2
+                                A2 = r2 - r1
+                                adv_concat = torch.cat([A1[valid], A2[valid]])
+                                if adv_concat.numel() > 1:
+                                    adv_std = adv_concat.std().clamp_min(1e-4)
+                                    A1 = A1 / adv_std
+                                    A2 = A2 / adv_std
+                                A1 = torch.where(valid, A1, torch.zeros_like(A1))
+                                A2 = torch.where(valid, A2, torch.zeros_like(A2))
 
-                            # diagnostics (detached, for logging only)
-                            _adv_mag = A1[valid].abs().mean().item() if valid.any() else 0.0
-                            _r_mag = ((r1[valid].abs() + r2[valid].abs()) / 2).mean().item() if valid.any() else 0.0
-                            _lp_diff = (lp1[valid] - lp2[valid]).abs().mean().item() if valid.any() else 0.0
+                                lp1 = plackett_luce_log_prob(upm_scores, U1, mask_idx)
+                                lp2 = plackett_luce_log_prob(upm_scores, U2, mask_idx)
+                                lp1 = torch.where(valid, lp1, torch.zeros_like(lp1))
+                                lp2 = torch.where(valid, lp2, torch.zeros_like(lp2))
+
+                                per_sample = -(A1 * lp1 + A2 * lp2)
+                                per_sample = per_sample * valid.float()
+                                upm_loss = per_sample.sum() / valid.sum().clamp_min(1).float()
+
+                                _adv_mag = A1[valid].abs().mean().item() if valid.any() else 0.0
+                                _r_mag = ((r1[valid].abs() + r2[valid].abs()) / 2).mean().item() if valid.any() else 0.0
+                                _lp_diff = (lp1[valid] - lp2[valid]).abs().mean().item() if valid.any() else 0.0
+                            else:
+                                upm_loss = upm_scores_raw.sum() * 0.0
+                                _adv_mag = 0.0
+                                _r_mag = 0.0
+                                _lp_diff = 0.0
                         else:
-                            # Connect to UPM graph so DDP sees the same params on every rank
+                            # Warmup phase: MDM only, UPM contributes zero loss
+                            # Pool will use confidence-based ordering instead of UPM
                             upm_loss = upm_scores_raw.sum() * 0.0
                             _adv_mag = 0.0
                             _r_mag = 0.0
@@ -610,8 +623,8 @@ def main(cfg: DictConfig):
                         batch = itr
                         input_ids = batch["labels"].to(device)
                         prompt_mask = batch["prompt_mask"].to(device) if "prompt_mask" in batch else (input_ids == 151643).to(device)
-                        # loss = mdm_loss(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
-                        loss = mdm_loss_loglinear(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
+                        loss = mdm_loss(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
+                        #loss = mdm_loss_loglinear(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
                     elif strategy == "arm":
                         batch = itr
                         input_ids = batch["labels"].to(device)
@@ -633,8 +646,10 @@ def main(cfg: DictConfig):
 
             # update pool every micro-step (chain advances regardless of accumulation)
             if strategy == "progressive":
-                #pool.update_with_logits(log_probs)
-                pool.update_with_upm_scores(upm_scores.detach(), log_probs.detach())
+                if use_upm:
+                    pool.update_with_upm_scores(upm_scores.detach(), log_probs.detach())
+                else:
+                    pool.update_with_logits(log_probs)
 
 
             global_step += 1
@@ -642,10 +657,8 @@ def main(cfg: DictConfig):
 
             if micro_step % accum_steps == 0:
                 if train_cfg.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        list(model.parameters()) + list(upm.parameters()),
-                        train_cfg.max_grad_norm
-                    )
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(upm.parameters(), train_cfg.max_grad_norm)
                 optimizer.step()
                 
                 if train_cfg.ema is not None:
@@ -667,7 +680,7 @@ def main(cfg: DictConfig):
                             wandb.log({"grad_norm": gn}, step=opt_step)
 
                             if strategy == "progressive":
-                                wandb.log({"current_k": current_k}, step=opt_step)
+                                wandb.log({"current_k": current_k, "upm_active": int(use_upm)}, step=opt_step)
 
                 # DDP-reduced mdm / upm losses (all ranks must participate)
                 if strategy == "progressive" and should_log:
@@ -733,7 +746,10 @@ def main(cfg: DictConfig):
                         wandb.log({"val_loss": val_loss}, step=opt_step)
 
                     if opt_step % train_cfg.save_steps == 0 and train_cfg.ema is not None:
-                        saved_path = save_ema_snapshot(ckpt_dir, model, ema, cfg, epoch, opt_step, val_loss, val_acc_dict)
+                        extra_dict = deepcopy(val_acc_dict) if val_acc_dict is not None else {}
+                        extra_dict["optimizer_state_dict"] = optimizer.state_dict()
+                        extra_dict["upm_state_dict"] = upm_module.state_dict()
+                        saved_path = save_ema_snapshot(ckpt_dir, model, ema, cfg, epoch, opt_step, val_loss, extra_dict)
                         if saved_path is not None:
                             if last_ema_ckpt_path and os.path.exists(last_ema_ckpt_path):
                                 os.remove(last_ema_ckpt_path)
@@ -745,10 +761,13 @@ def main(cfg: DictConfig):
 
                     if opt_step % train_cfg.save_steps == 0:
                         # save non-EMA snapshot
+                        extra_dict = deepcopy(val_acc_dict) if val_acc_dict is not None else {}
+                        extra_dict["optimizer_state_dict"] = optimizer.state_dict()
+                        extra_dict["upm_state_dict"] = upm_module.state_dict()
                         saved_path = save_model_snapshot(
                             ckpt_dir, model, cfg, epoch, opt_step,
                             val_loss=val_loss,
-                            extra=val_acc_dict,
+                            extra=extra_dict,
                         )
                         if saved_path is not None:
                             if last_model_ckpt_path and os.path.exists(last_model_ckpt_path):
@@ -757,6 +776,44 @@ def main(cfg: DictConfig):
                             print(f"Model saved to: {saved_path}")
                         #if saved_path is not None:
                             #print(f"Model saved to: {saved_path}")
+
+                # --- Generate diagnostic samples (rank 0 only) ---
+                if is_main:
+                    n_samples = 4
+                    L = model_config.max_position
+                    x_t = torch.full((n_samples, L), mask_id, dtype=torch.long, device=device)
+
+                    model_to_sample = model.module if isinstance(model, DDP) else model
+
+                    if train_cfg.ema is not None:
+                        ema.store(model_to_sample.parameters())
+                        ema.copy_to(model_to_sample.parameters())
+
+                    with torch.inference_mode():
+                        diag_sampling_cfg = deepcopy(val_cfg.sampling)
+                        # Unpack ListConfig to scalar so mdm_sampling doesn't crash
+                        if isinstance(diag_sampling_cfg.confidence, (ListConfig, list)):
+                            diag_sampling_cfg.confidence = str(diag_sampling_cfg.confidence[0])
+                        if isinstance(diag_sampling_cfg.unmasking_num, (ListConfig, list)):
+                            diag_sampling_cfg.unmasking_num = int(diag_sampling_cfg.unmasking_num[0])
+                        
+                        # FORCE temperature > 0 for diagnostic unconditional generation to prevent repeating loops
+                        diag_sampling_cfg.temperature = 1.5
+                        
+                        samples = mdm_sampling(model_to_sample, x_t, mask_id, diag_sampling_cfg, device=device)
+
+                    if train_cfg.ema is not None:
+                        ema.restore(model_to_sample.parameters())
+
+                    tok = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
+                    print(f"\n{'='*60}")
+                    print(f"GENERATED SAMPLES (step {opt_step})")
+                    print(f"{'='*60}")
+                    for i in range(n_samples):
+                        text = tok.decode(samples[i].tolist(), skip_special_tokens=True)
+                        print(f"\n--- Sample {i+1} ---")
+                        print(text[:500])
+                    print(f"{'='*60}\n")
 
                 model.train()
                 upm.train()
