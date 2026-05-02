@@ -1,0 +1,201 @@
+Running on: x3211c0s19b0n0
+
+Lmod is automatically replacing "nvidia/25.5" with "gcc-native/14".
+
+
+Lmod is automatically replacing "PrgEnv-nvidia/8.6.0" with "PrgEnv-gnu/8.6.0".
+
+
+Due to MODULEPATH changes, the following have been reloaded:
+  1) cray-mpich/9.0.1
+
+Python being used:
+/home/aakarsh/.conda/envs/trlx-stable/bin/python
+[rank 0] Using device: cuda:0
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/aakarsh/.netrc.
+wandb: Currently logged in as: aakarshnrai to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+[rank 1] Using device: cuda:1
+[rank 2] Using device: cuda:2
+[rank 3] Using device: cuda:3
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Vocab size: 50259, Mask token ID: 50257
+Vocab size: 50259, Mask token ID: 50257
+Vocab size: 50259, Mask token ID: 50257
+wandb: setting up run 3h690xuu
+wandb: Tracking run with wandb version 0.24.2
+wandb: Run data is saved locally in /lus/eagle/projects/lighthouse-purdue/rai53/files/lomdm_implementation/wandb/run-20260215_185418-3h690xuu
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run lomdm-openwebtext-no-scaling-alcf
+wandb: ⭐️ View project at https://wandb.ai/aakarshnrai-purdue-university/LO_Training
+wandb: 🚀 View run at https://wandb.ai/aakarshnrai-purdue-university/LO_Training/runs/3h690xuu
+Vocab size: 50259, Mask token ID: 50257
+Model parameters: 177,572,354Model parameters: 177,572,354Model parameters: 177,572,354
+
+Model parameters: 177,572,354
+
+  Backbone: 162,216,960  Backbone: 162,216,960
+
+  Forward scheduler: 7,677,697  Forward scheduler: 7,677,697
+
+  Reverse scheduler: 7,677,697  Backbone: 162,216,960  Reverse scheduler: 7,677,697
+
+
+  Forward scheduler: 7,677,697
+  Reverse scheduler: 7,677,697
+  Backbone: 162,216,960
+  Forward scheduler: 7,677,697Loading dataset...Loading dataset...
+
+
+Loading dataset...
+  Reverse scheduler: 7,677,697
+Loading dataset...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Map (num_proc=8):   0%|          | 0/8013769 [00:00<?, ? examples/s]Token indices sequence length is longer than the specified maximum sequence length for this model (1217 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (1217 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (1217 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (1217 > 1024). Running this sequence through the model will result in indexing errors
+Map (num_proc=8):   0%|          | 1000/8013769 [00:02<6:26:30, 345.52 examples/s]Token indices sequence length is longer than the specified maximum sequence length for this model (1702 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (1702 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (1702 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (1702 > 1024). Running this sequence through the model will result in indexing errors
+Map (num_proc=8):   0%|          | 2000/8013769 [00:03<3:25:18, 650.40 examples/s]Token indices sequence length is longer than the specified maximum sequence length for this model (2589 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (2589 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (2589 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (2589 > 1024). Running this sequence through the model will result in indexing errors
+Map (num_proc=8):   0%|          | 3000/8013769 [00:03<2:20:38, 949.32 examples/s]Token indices sequence length is longer than the specified maximum sequence length for this model (2708 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (2708 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (2708 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (2708 > 1024). Running this sequence through the model will result in indexing errors
+Map (num_proc=8):   0%|          | 4000/8013769 [00:04<1:47:49, 1238.10 examples/s]Token indices sequence length is longer than the specified maximum sequence length for this model (1242 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (1242 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (1242 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (1242 > 1024). Running this sequence through the model will result in indexing errors
+Map (num_proc=8):   0%|          | 6000/8013769 [00:05<1:16:04, 1754.43 examples/s]Token indices sequence length is longer than the specified maximum sequence length for this model (1468 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (1468 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (1468 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (1468 > 1024). Running this sequence through the model will result in indexing errors
+Map (num_proc=8):   0%|          | 7000/8013769 [00:05<1:10:37, 1889.69 examples/s]Token indices sequence length is longer than the specified maximum sequence length for this model (2426 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (2426 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (2426 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (2426 > 1024). Running this sequence through the model will result in indexing errors
+Map (num_proc=8):   0%|          | 9000/8013769 [00:05<45:54, 2906.51 examples/s]  Token indices sequence length is longer than the specified maximum sequence length for this model (2878 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (2878 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (2878 > 1024). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (2878 > 1024). Running this sequence through the model will result in indexing errors
+Map (num_proc=8): 100%|██████████| 8013769/8013769 [37:28<00:00, 3563.34 examples/s] 
+Map (num_proc=8): 100%|██████████| 8013769/8013769 [37:28<00:00, 3563.27 examples/s]
+Map (num_proc=8):   0%|          | 0/8013769 [00:05<?, ? examples/s]9.05 examples/s]
+[rank1]: multiprocess.pool.RemoteTraceback: 
+[rank1]: """
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/multiprocess/pool.py", line 125, in worker
+[rank1]:     result = (True, func(*args, **kwds))
+[rank1]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/utils/py_utils.py", line 586, in _write_generator_to_queue
+[rank1]:     for i, result in enumerate(func(**kwargs)):
+[rank1]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/arrow_dataset.py", line 3714, in _map_single
+[rank1]:     writer.write_batch(batch, try_original_type=try_original_type)
+[rank1]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/arrow_writer.py", line 660, in write_batch
+[rank1]:     pa_table = pa.Table.from_arrays(arrays, schema=schema)
+[rank1]:   File "pyarrow/table.pxi", line 4913, in pyarrow.lib.Table.from_arrays
+[rank1]:   File "pyarrow/table.pxi", line 4257, in pyarrow.lib.Table.validate
+[rank1]:   File "pyarrow/error.pxi", line 92, in pyarrow.lib.check_status
+[rank1]: pyarrow.lib.ArrowInvalid: Column 1 named attention_mask expected length 4401 but got length 1000
+[rank1]: """
+
+[rank1]: The above exception was the direct cause of the following exception:
+
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/lus/eagle/projects/lighthouse-purdue/rai53/files/lomdm_implementation/train.py", line 554, in <module>
+[rank1]:     main()
+[rank1]:   File "/lus/eagle/projects/lighthouse-purdue/rai53/files/lomdm_implementation/train.py", line 387, in main
+[rank1]:     dataset = get_dataset(args, tokenizer)
+[rank1]:   File "/lus/eagle/projects/lighthouse-purdue/rai53/files/lomdm_implementation/train.py", line 133, in get_dataset
+[rank1]:     packed_dataset = tokenized_dataset.map(group_texts, batched=True, num_proc=8)
+[rank1]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/arrow_dataset.py", line 562, in wrapper
+[rank1]:     out: Union["Dataset", "DatasetDict"] = func(self, *args, **kwargs)
+[rank1]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/arrow_dataset.py", line 3334, in map
+[rank1]:     for rank, done, content in iflatmap_unordered(
+[rank1]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/utils/py_utils.py", line 626, in iflatmap_unordered
+[rank1]:     [async_result.get(timeout=0.05) for async_result in async_results]
+[rank1]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/utils/py_utils.py", line 626, in <listcomp>
+[rank1]:     [async_result.get(timeout=0.05) for async_result in async_results]
+[rank1]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/multiprocess/pool.py", line 774, in get
+[rank1]:     raise self._value
+[rank1]: pyarrow.lib.ArrowInvalid: Column 1 named attention_mask expected length 4401 but got length 1000
+Map (num_proc=8):   0%|          | 0/8013769 [00:05<?, ? examples/s]
+[rank2]: multiprocess.pool.RemoteTraceback: 
+[rank2]: """
+[rank2]: Traceback (most recent call last):
+[rank2]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/multiprocess/pool.py", line 125, in worker
+[rank2]:     result = (True, func(*args, **kwds))
+[rank2]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/utils/py_utils.py", line 586, in _write_generator_to_queue
+[rank2]:     for i, result in enumerate(func(**kwargs)):
+[rank2]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/arrow_dataset.py", line 3714, in _map_single
+[rank2]:     writer.write_batch(batch, try_original_type=try_original_type)
+[rank2]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/arrow_writer.py", line 660, in write_batch
+[rank2]:     pa_table = pa.Table.from_arrays(arrays, schema=schema)
+[rank2]:   File "pyarrow/table.pxi", line 4913, in pyarrow.lib.Table.from_arrays
+[rank2]:   File "pyarrow/table.pxi", line 4257, in pyarrow.lib.Table.validate
+[rank2]:   File "pyarrow/error.pxi", line 92, in pyarrow.lib.check_status
+[rank2]: pyarrow.lib.ArrowInvalid: Column 1 named attention_mask expected length 4401 but got length 1000
+[rank2]: """
+
+[rank2]: The above exception was the direct cause of the following exception:
+
+[rank2]: Traceback (most recent call last):
+[rank2]:   File "/lus/eagle/projects/lighthouse-purdue/rai53/files/lomdm_implementation/train.py", line 554, in <module>
+[rank2]:     main()
+[rank2]:   File "/lus/eagle/projects/lighthouse-purdue/rai53/files/lomdm_implementation/train.py", line 387, in main
+[rank2]:     dataset = get_dataset(args, tokenizer)
+[rank2]:   File "/lus/eagle/projects/lighthouse-purdue/rai53/files/lomdm_implementation/train.py", line 133, in get_dataset
+[rank2]:     packed_dataset = tokenized_dataset.map(group_texts, batched=True, num_proc=8)
+[rank2]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/arrow_dataset.py", line 562, in wrapper
+[rank2]:     out: Union["Dataset", "DatasetDict"] = func(self, *args, **kwargs)
+[rank2]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/arrow_dataset.py", line 3334, in map
+[rank2]:     for rank, done, content in iflatmap_unordered(
+[rank2]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/utils/py_utils.py", line 626, in iflatmap_unordered
+[rank2]:     [async_result.get(timeout=0.05) for async_result in async_results]
+[rank2]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/datasets/utils/py_utils.py", line 626, in <listcomp>
+[rank2]:     [async_result.get(timeout=0.05) for async_result in async_results]
+[rank2]:   File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/multiprocess/pool.py", line 774, in get
+[rank2]:     raise self._value
+[rank2]: pyarrow.lib.ArrowInvalid: Column 1 named attention_mask expected length 4401 but got length 1000
+Map (num_proc=8): 100%|█████████▉| 8004327/8013769 [37:36<00:08, 1130.18 examples/s]W0215 19:32:13.107000 3326246 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 3326314 closing signal SIGTERM
+W0215 19:32:13.110000 3326246 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 3326317 closing signal SIGTERM
+E0215 19:32:13.206000 3326246 site-packages/torch/distributed/elastic/multiprocessing/api.py:869] failed (exitcode: 1) local_rank: 1 (pid: 3326315) of binary: /home/aakarsh/.conda/envs/trlx-stable/bin/python3.10
+Traceback (most recent call last):
+  File "/home/aakarsh/.conda/envs/trlx-stable/bin/torchrun", line 7, in <module>
+    sys.exit(main())
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 355, in wrapper
+    return f(*args, **kwargs)
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/distributed/run.py", line 919, in main
+    run(args)
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/distributed/run.py", line 910, in run
+    elastic_launch(
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 138, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/home/aakarsh/.conda/envs/trlx-stable/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 269, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+train.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-02-15_19:32:13
+  host      : x3211c0s19b0n0.hsn.cm.polaris.alcf.anl.gov
+  rank      : 2 (local_rank: 2)
+  exitcode  : 1 (pid: 3326316)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-02-15_19:32:13
+  host      : x3211c0s19b0n0.hsn.cm.polaris.alcf.anl.gov
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 3326315)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

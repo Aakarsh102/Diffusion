@@ -31,7 +31,9 @@ from transformers import AutoTokenizer
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cfg", type=str)
+    parser.add_argument("--cfg", type=str, required=True)
+    parser.add_argument("--mdm_ckpt", type=str, required=True, help="Path to pre-trained MDM checkpoint")
+    parser.add_argument("--upm_ckpt", type=str, required=True, help="Path to supervised-trained UPM checkpoint")
     return parser.parse_args()
 
 
@@ -271,7 +273,7 @@ def parse_k_schedule_increasing(k_schedule) -> List[Tuple[int, int]]:
 
 
 
-def main(cfg: DictConfig):
+def main(cfg: DictConfig, mdm_ckpt_path: str, upm_ckpt_path: str):
     # setup the DDP
     rank, world_size, local_rank = setup_ddp()
     is_main = (rank == 0)
@@ -287,7 +289,7 @@ def main(cfg: DictConfig):
     torch.cuda.manual_seed(seed)
 
     # ckpt dir
-    ckpt_dir = f"ckptsupmsched/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
+    ckpt_dir = f"newpumafinal/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
     os.makedirs(ckpt_dir, exist_ok=True)
     if is_main:
         print(f"Checkpoints will be saved to: {ckpt_dir}")
@@ -312,14 +314,6 @@ def main(cfg: DictConfig):
     model_config = MDMConfig(**model_cfg_dict)
     model = MDMTransformer(model_config).to(device)
     condition_dim = model_config.hidden_size  # must be even; each half = 128
-#    ckpt = torch.load("~/ckptsPUMATRAININGCOMPLETE1288gpu/date=2026-04-15-23-38/ema_step=370000.pt", map_location=device, weights_only=True)
-   # ckpt = torch.load("/home/aakarsh/ckptsPUMATRAININGCOMPLETE1288gpu/date=2026-04-15-23-38/ema_step=370000.pt", map_location=device, weights_only=True)
-    
-    #sd = ckpt.get("model_state_dict", ckpt)
-    ## Strip 'module.' prefix if saved from DDP
-    #sd = {k.replace("module.", ""): v for k, v in sd.items()}
-    #model.load_state_dict(sd, strict=True)
-   # model
     upm = UPM(
         hidden_size=model_config.hidden_size,
         condition_dim=condition_dim,
@@ -330,15 +324,22 @@ def main(cfg: DictConfig):
         num_params = sum(p.numel() for p in upm.parameters())
         print(f"UPM parameters: {num_params/1e6:.2f}M")
 
-    # ARM initialization
-    arm_init_path = model_cfg_dict.get("arm_init", "none")
-    if arm_init_path != "none":
-        model_config.predict_next_token = True
-        if is_main:
-            print(f"Initializing MDM from ARM checkpoint: {arm_init_path}")
-        arm_ckpt = torch.load(arm_init_path, map_location="cpu")
-        sd = arm_ckpt.get("model_state_dict", arm_ckpt)
-        model.load_state_dict(sd, strict=True)
+    if is_main:
+        print(f"Loading MDM checkpoint from: {mdm_ckpt_path}")
+    mdm_ckpt = torch.load(mdm_ckpt_path, map_location="cpu")
+    mdm_sd = mdm_ckpt.get("model_state_dict", mdm_ckpt)
+    mdm_sd = {k.replace("module.", ""): v for k, v in mdm_sd.items()}
+    model.load_state_dict(mdm_sd, strict=True)
+
+    #for p in model.parameters():
+    #    p.requires_grad = False
+
+    if is_main:
+        print(f"Loading UPM checkpoint from: {upm_ckpt_path}")
+    upm_ckpt = torch.load(upm_ckpt_path, map_location="cpu")
+    upm_sd = upm_ckpt.get("upm_state_dict", upm_ckpt)
+    upm_sd = {k.replace("module.", ""): v for k, v in upm_sd.items()}
+    upm.load_state_dict(upm_sd, strict=True)
 
 
     if is_main:
@@ -347,7 +348,7 @@ def main(cfg: DictConfig):
 
     # model wrapping
     if world_size > 1 and torch.cuda.is_available():
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        #model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         upm = DDP(upm, device_ids=[local_rank], output_device=local_rank)
         if is_main:
             print(f"Model wrapping is done!")
@@ -356,6 +357,7 @@ def main(cfg: DictConfig):
         list(model.parameters())
         + list(upm.parameters())
     )
+    all_params = upm.parameters()
     
 
 
@@ -410,12 +412,12 @@ def main(cfg: DictConfig):
         train_sampler = None
 
     # optimizer and scheduler
-    upm_lr = train_cfg.learning_rate / 10;
+    upm_lr = train_cfg.learning_rate / 30
     optimizer = optim.AdamW(
         [
-            {"params": model.parameters(), "lr": train_cfg.learning_rate},
-            {"params": upm.parameters(), "lr": upm_lr}
-        ], 
+            # {"params": model.parameters(), "lr": train_cfg.learning_rate},
+            {"params": upm.parameters(), "lr": upm_lr},
+        ],
         weight_decay=train_cfg.weight_decay,
     )
     #optimizer = optim.AdamW(model.parameters(), lr=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay)
@@ -431,6 +433,7 @@ def main(cfg: DictConfig):
 
     strategy = train_cfg.strategy
     upm_warmup_steps = getattr(train_cfg, "upm_warmup_steps", 0)
+    #upm_warmup_steps = 0
     if is_main and upm_warmup_steps > 0:
         print(f"UPM warmup: {upm_warmup_steps} optimizer steps (confidence-based ordering, no RLOO)")
     # k schedule for progressive unmasking. If None use fixed K. If "linear", linearly increase the unmasking steps from 1 to K over the training steps.
@@ -464,7 +467,7 @@ def main(cfg: DictConfig):
 
 
     # training loop
-    global_step = 0
+    global_step = 370000
     accum_steps = getattr(train_cfg, "grad_accum_steps", 1)
     last_ema_ckpt_path = None
     last_model_ckpt_path = None
@@ -475,7 +478,7 @@ def main(cfg: DictConfig):
         wandb.init(project=cfg.wandb.project, entity = "aakarshnrai-purdue-university",name=cfg.wandb.name)
     from contextlib import nullcontext, ExitStack
     for epoch in range(train_cfg.num_epochs):
-        model.train()
+        model.eval()
         upm.train()
         upm_module = upm.module if isinstance(upm, DDP) else upm
         model_module = model.module if isinstance(model, DDP) else model
@@ -504,7 +507,6 @@ def main(cfg: DictConfig):
         accum_lp_diff = 0.0
         micro_step = 0
 
-        print("fixed_unmask")
         # helper: skip DDP gradient sync on non-final micro-steps
         use_ddp = isinstance(model, DDP)
         def maybe_no_sync():
@@ -548,7 +550,7 @@ def main(cfg: DictConfig):
                         opt_step_now = global_step // accum_steps
                         use_upm = opt_step_now >= upm_warmup_steps
 
-                        if use_upm or True:
+                        if use_upm:
                             log_conf = (logits.max(dim=-1).values - logits.logsumexp(dim=-1)).detach()
                             blended_scores = upm_scores_raw + log_conf
                             #blended_scores = upm_scores_raw
@@ -562,10 +564,11 @@ def main(cfg: DictConfig):
                             mean_L_eff = pool.state['L_eff'].float().mean()
                             k_unmask = max(int(mean_L_eff / pool.K), 1)
                             k_unmask = 1
-                            if (opt_step_now) > (25000 + upm_warmup_steps):
+                            if k_unmask > 420000:
                                 k_unmask = 2
-                            if (opt_step_now) > (60000 + upm_warmup_steps):
+                            if k_unmask > 500000:
                                 k_unmask = 3
+
                             n_masked_per_seq = mask_idx.sum(dim=1)
                             valid = n_masked_per_seq >= k_unmask
 
@@ -584,7 +587,6 @@ def main(cfg: DictConfig):
                                 pred_tok = logits.detach().argmax(dim = -1)
                                 xt_after_1[batch_indices, U1] = pred_tok[batch_indices, U1]
                                 xt_after_2[batch_indices, U2] = pred_tok[batch_indices, U2]
-
 
                                 r1, r2 = compute_reward_pair(
                                     model_module, pool.x0, logits.detach(), xt_after_1, xt_after_2,
@@ -633,8 +635,8 @@ def main(cfg: DictConfig):
                         batch = itr
                         input_ids = batch["labels"].to(device)
                         prompt_mask = batch["prompt_mask"].to(device) if "prompt_mask" in batch else (input_ids == 151643).to(device)
-                        loss = mdm_loss(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
-                        #loss = mdm_loss_loglinear(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
+                        # loss = mdm_loss(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
+                        loss = mdm_loss_loglinear(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
                     elif strategy == "arm":
                         batch = itr
                         input_ids = batch["labels"].to(device)
@@ -667,8 +669,10 @@ def main(cfg: DictConfig):
 
             if micro_step % accum_steps == 0:
                 if train_cfg.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
-                    torch.nn.utils.clip_grad_norm_(upm.parameters(), train_cfg.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(
+                        list(model.parameters()) + list(upm.parameters()),
+                        train_cfg.max_grad_norm
+                    )
                 optimizer.step()
                 
                 if train_cfg.ema is not None:
@@ -721,7 +725,7 @@ def main(cfg: DictConfig):
 
                 # validaton on the downstream task; disabled when we use EMA
                 if train_cfg.ema is None:
-                    val_acc_dict = evaluate_ddp_dict(model_module, cfg, device, rank, world_size, upm=upm_module if use_upm else None)
+                    val_acc_dict = evaluate_ddp_dict(model_module, cfg, device, rank, world_size, upm=upm_module)
                 else:
                     val_acc_dict = None
 
@@ -756,11 +760,7 @@ def main(cfg: DictConfig):
                         wandb.log({"val_loss": val_loss}, step=opt_step)
 
                     if opt_step % train_cfg.save_steps == 0 and train_cfg.ema is not None:
-                        extra_dict = deepcopy(val_acc_dict) if val_acc_dict is not None else {}
-                        extra_dict["optimizer_state_dict"] = optimizer.state_dict()
-                        extra_dict["upm_state_dict"] = upm_module.state_dict()
-                        extra_dict["scheduler_state_dict"] = scheduler.state_dict()
-                        saved_path = save_ema_snapshot(ckpt_dir, model, ema, cfg, epoch, opt_step, val_loss, extra_dict)
+                        saved_path = save_ema_snapshot(ckpt_dir, model, ema, cfg, epoch, opt_step, val_loss, val_acc_dict)
                         if saved_path is not None:
                             if last_ema_ckpt_path and os.path.exists(last_ema_ckpt_path):
                                 os.remove(last_ema_ckpt_path)
@@ -772,14 +772,10 @@ def main(cfg: DictConfig):
 
                     if opt_step % train_cfg.save_steps == 0:
                         # save non-EMA snapshot
-                        extra_dict = deepcopy(val_acc_dict) if val_acc_dict is not None else {}
-                        extra_dict["optimizer_state_dict"] = optimizer.state_dict()
-                        extra_dict["upm_state_dict"] = upm_module.state_dict()
-                        extra_dict["scheduler_state_dict"] = scheduler.state_dict()
                         saved_path = save_model_snapshot(
                             ckpt_dir, model, cfg, epoch, opt_step,
                             val_loss=val_loss,
-                            extra=extra_dict,
+                            extra=val_acc_dict,
                         )
                         if saved_path is not None:
                             if last_model_ckpt_path and os.path.exists(last_model_ckpt_path):
@@ -803,16 +799,14 @@ def main(cfg: DictConfig):
 
                     with torch.inference_mode():
                         diag_sampling_cfg = deepcopy(val_cfg.sampling)
-                        # Unpack ListConfig to scalar so mdm_sampling doesn't crash
                         if isinstance(diag_sampling_cfg.confidence, (ListConfig, list)):
-                            diag_sampling_cfg.confidence = str(diag_sampling_cfg.confidence[0])
+                            diag_sampling_cfg.confidence = diag_sampling_cfg.confidence[0]
                         if isinstance(diag_sampling_cfg.unmasking_num, (ListConfig, list)):
-                            diag_sampling_cfg.unmasking_num = int(diag_sampling_cfg.unmasking_num[0])
-
+                            diag_sampling_cfg.unmasking_num = diag_sampling_cfg.unmasking_num[0]
                         diag_sampling_cfg.temperature = 1.5
-                        if strategy == "progressive" and upm is not None and use_upm:
+                        if strategy == "progressive" and upm is not None:
                             upm_to_sample = upm.module if isinstance(upm, DDP) else upm
-                            samples = mdm_sampling_upm(model_to_sample, upm_to_sample, x_t, mask_id, diag_sampling_cfg, blend = True, device=device)
+                            samples = mdm_sampling_upm(model_to_sample, upm_to_sample, x_t, mask_id, diag_sampling_cfg, device=device)
                         else:
                             samples = mdm_sampling(model_to_sample, x_t, mask_id, diag_sampling_cfg, device=device)
 
@@ -829,7 +823,7 @@ def main(cfg: DictConfig):
                         print(text[:500])
                     print(f"{'='*60}\n")
 
-                model.train()
+                model.eval()
                 upm.train()
     
     if cfg.wandb.wandb and is_main:
@@ -841,6 +835,5 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     args = parse_args()
-    cfg_path = args.cfg
-    cfg = OmegaConf.load(cfg_path)
-    main(cfg)
+    cfg = OmegaConf.load(args.cfg)
+    main(cfg, args.mdm_ckpt, args.upm_ckpt)

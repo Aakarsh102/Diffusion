@@ -14,9 +14,10 @@ model:
 
 training:
   strategy: "progressive"
-  mode: "confidence_collapse"
+  mode: "standard"
   confidence_threshold: 0.9
   eos_id: 151643
+  upm_warmup_steps: 10000  # optimizer steps of confidence-based PUMA before enabling UPM+RLOO
   K: 12
   block_size: 256
   k_schedule:

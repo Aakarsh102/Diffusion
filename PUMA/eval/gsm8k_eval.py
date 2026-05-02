@@ -10,7 +10,7 @@ import re
 import json
 import warnings
 from transformers import AutoTokenizer
-from sampling import mdm_sampling, mdm_sampling_block, arm_sampling, mdm_sampling_upm
+from sampling import mdm_sampling, mdm_sampling_block, arm_sampling
 from tqdm import tqdm
 from datasets import load_dataset
 import torch.nn as nn
@@ -132,6 +132,7 @@ def test_gsm8k_tokenization(mask_id: int):
 
 
 def evaluate_ddp_gsm8k(model, cfg, device, rank: int, world_size: int, sampling, upm=None):
+    #upm = None
     mask_id = cfg.data.mask_id
 
     # pre-tokenize the gsm8k test set and load it
@@ -177,12 +178,12 @@ def evaluate_ddp_gsm8k(model, cfg, device, rank: int, world_size: int, sampling,
             # sample preproceessing, and extract the answer part
             sample_ids = samples_tensor.cpu().numpy()
             samples = tokenizer.batch_decode(sample_ids, skip_special_tokens=True)
-            
             if j == 0 and rank == 0:
                 print(f"\n--- [EVAL SAMPLE 1] ---")
                 print(f"Generated:\n{samples[0]}\n")
                 print(f"Target Answer:\n{batch_answers[0]}\n-----------------------\n")
 
+            
             for sample, answer in zip(samples, batch_answers):
                 if evaluate_samples(sample, answer):
                     local_correct += 1
@@ -369,6 +370,7 @@ def _to_number(x):
     return None
 
 
+
 @torch.no_grad()
 def mdm_sampling_upm(model, upm, xt, mask_id, sampling_cfg, device=None):
     temperature = sampling_cfg.temperature
@@ -401,11 +403,56 @@ def mdm_sampling_upm(model, upm, xt, mask_id, sampling_cfg, device=None):
 
         # Blend: UPM score + log(max_prob) so even untrained UPM
         # falls back to confidence-based ordering instead of random.
-        # log_prob_max = max_logit - logsumexp: exact, no extra (B,L,V) memory.
         log_conf = logits.max(dim=-1).values - logits.logsumexp(dim=-1)  # (B, L)
         blended = upm_scores + log_conf
+        #blended = upm_scores
 
         unmasking_score = blended.masked_fill(~mask_indices, float('-inf'))
+
+        for j in range(B):
+            k = min(unmasking_num, int(mask_indices[j].sum().item()))
+            if k > 0:
+                _, idx = torch.topk(unmasking_score[j], k=k)
+                xt[j, idx] = torch.argmax(logits_with_noise[j, idx], dim=-1)
+    
+    return xt
+
+
+
+
+
+
+
+
+@torch.no_grad()
+def mdm_sampling_upm_new_old(model, upm, xt, mask_id, sampling_cfg, device=None):
+    temperature = sampling_cfg.temperature
+    unmasking_num = int(sampling_cfg.unmasking_num)
+    B, L = xt.shape
+    xt = xt.clone()
+    K_steps = L // unmasking_num + 1
+
+    # prompt positions never change — identify them once
+    prompt_mask = (xt != mask_id)  # True for prompt tokens at step 0
+    L_eff = (~prompt_mask).sum(dim=1).clamp_min(1).float()  # non-prompt length per seq
+
+    for step in range(K_steps):
+        mask_indices = (xt == mask_id)
+        if mask_indices.sum() == 0:
+            break
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits, hidden = model(xt, return_hidden=True)
+
+        logits_with_noise = gumbel_softmax(logits, temperature=temperature)
+
+        # t_step = fraction of non-prompt tokens already unmasked
+        # This matches training where t_step = phase / K
+        n_unmasked = (~mask_indices & ~prompt_mask).sum(dim=1).float()
+        t_step = (n_unmasked / L_eff).clamp(0.0, 1.0)  # (B,)
+
+        upm_scores = upm(hidden, t_step, mask_indices)
+        unmasking_score = upm_scores.masked_fill(~mask_indices, float('-inf'))
 
         for j in range(B):
             k = min(unmasking_num, int(mask_indices[j].sum().item()))

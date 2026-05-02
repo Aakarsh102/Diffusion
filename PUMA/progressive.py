@@ -26,6 +26,7 @@ def mdm_loss_fn(log_probs: torch.Tensor, x0: torch.Tensor, xt: torch.Tensor, mas
     num_mask = masked.sum(dim=1, keepdim=True).clamp_min(1).float()
 
     if masked.sum().item() == 0:
+        #raise ValueError(f"FATAL: masked.sum()==0. mask_id={mask_id}, unique xt={torch.unique(xt)}")
         return log_probs.sum() * 0.0
     
     # compute the likelihood w.r.t. the true positions
@@ -353,7 +354,14 @@ class PhasedMasking:
         self.xt = xt
         self.state['phase'] = phase_next
 
-        # refill (unchanged)
+        #############################################################
+        # Also replace immediately if the sequence has completely unmasked (no mask tokens left)
+        # Otherwise, fully unmasked sequences sit in the pool generating exactly 0.0 gradient!
+        is_fully_unmasked = (xt == self.mask_id).sum(dim=1) == 0
+        replace = replace | is_fully_unmasked
+        #############################################################
+
+        # refill
         n_new = int(replace.sum().item())
         if n_new > 0:
             idx = replace.nonzero(as_tuple=False).squeeze(1)
